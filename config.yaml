@@ -1,0 +1,107 @@
+category:
+  name: "ai"
+  display_name: "AI Projects"
+  version: "1.0.0"
+
+dimensions:
+  tech_layer:
+    - id: foundation_model
+      name: "Foundation Model"
+    - id: training_framework
+      name: "Training Framework"
+    - id: inference_engine
+      name: "Inference Engine"
+    - id: ai_application
+      name: "AI Application"
+    - id: ai_toolchain
+      name: "AI Toolchain"
+
+  application:
+    - id: code_generation
+      name: "Code Generation"
+    - id: image_generation
+      name: "Image Generation"
+    - id: multimodal
+      name: "Multimodal"
+    - id: agent
+      name: "Agent"
+    - id: data_annotation
+      name: "Data Annotation"
+    - id: model_evaluation
+      name: "Model Evaluation"
+
+sources:
+  github:
+    topics:
+      - "artificial-intelligence"
+      - "machine-learning"
+      - "deep-learning"
+      - "llm"
+      - "generative-ai"
+      - "ai-agents"
+    languages: ["Python", "TypeScript", "Rust", "Go"]
+    star_range: [50, 50000]
+
+  trending:
+    languages: ["python", "typescript", "rust", "go"]
+    periods: ["daily", "weekly"]
+
+  ecosystems:
+    - "huggingface"
+    - "openai"
+    - "langchain-ai"
+    - "pytorch"
+
+early_burst:
+  enabled: true
+  min_score: 0.65
+  metrics:
+    star_velocity:
+      weight: 0.35
+      thresholds:
+        weekly_growth_rate: 0.15
+        daily_absolute: 10
+    activity_index:
+      weight: 0.25
+      thresholds:
+        commit_frequency: 3
+        pr_merge_rate: 0.3
+    community_buzz:
+      weight: 0.25
+      thresholds:
+        hn_mentions: 1
+        reddit_mentions: 2
+    novelty_signal:
+      weight: 0.15
+      thresholds:
+        first_commit_within_months: 6
+        unique_contributors_weekly: 2
+
+filters:
+  required:
+    has_readme: true
+    has_code: true
+    min_contributors: 1
+  skip_patterns:
+    - "awesome"
+    - "tutorial"
+    - "demo"
+
+scheduling:
+  bulk:
+    batch_size: 20
+    max_per_day: 100
+  incremental:
+    max_per_day: 15
+
+resilience:
+  github_api:
+    max_retries: 3
+    retry_delay_seconds: 60
+    rate_limit_wait_seconds: 3600
+  llm_analysis:
+    max_retries: 2
+    timeout_seconds: 300
+  star_history:
+    sample_interval_days: 1
+    min_samples_for_velocity: 3
