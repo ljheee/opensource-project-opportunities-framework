@@ -281,10 +281,20 @@ Return ONLY the JSON, no other text."""
             print(f"  CLI tool not found: {cmd}")
             return None
 
-        result = subprocess.run(
-            [cmd] + extra_args + ['-p', prompt],
-            capture_output=True, text=True, timeout=300, shell=False
-        )
+        # Detect cursor/agent mode: prompt via stdin; claude mode: prompt via -p arg
+        is_agent = 'agent' in cli_tool or 'cursor-agent' in cli_tool
+
+        if is_agent:
+            result = subprocess.run(
+                [cmd] + extra_args,
+                input=prompt,
+                capture_output=True, text=True, timeout=300, shell=False
+            )
+        else:
+            result = subprocess.run(
+                [cmd] + extra_args + ['-p', prompt],
+                capture_output=True, text=True, timeout=300, shell=False
+            )
 
         if result.returncode != 0:
             print(f"  LLM error: {result.stderr}")
