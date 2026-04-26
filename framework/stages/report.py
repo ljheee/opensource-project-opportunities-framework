@@ -14,6 +14,7 @@ def _escape_md(text) -> str:
     text = str(text).replace('\\', '\\\\').replace('|', '\\|')
     text = text.replace('[', '\\[').replace(']', '\\]')
     text = text.replace('*', '\\*').replace('_', '\\_')
+    text = text.replace('`', '\\`')
     text = text.replace('\n', ' ')
     return text
 
