@@ -14,6 +14,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from framework.core.db import Database
 
 
+def _predicted_growth(overall_score: float) -> float:
+    """Compute expected daily star growth from an overall score."""
+    return max((overall_score or 0) * 8, 1)
+
+
 def record_new_predictions(db: Database):
     """Record predictions for projects first marked as early-burst."""
     conn = db.get_conn()
@@ -41,7 +46,7 @@ def record_new_predictions(db: Database):
 
         recorded = 0
         for row in cur.fetchall():
-            predicted_growth = max((row['overall_score'] or 0) * 8, 1)
+            predicted_growth = _predicted_growth(row['overall_score'])
             conn.execute('''
                 INSERT INTO prediction_outcomes
                 (project_id, predicted_at, stars_at_prediction,
@@ -89,10 +94,13 @@ def check_pending_outcomes(db: Database, min_days: int = 7):
             days = max(row['days_elapsed'] or min_days, 1)
 
             # Actual growth rate per day
-            actual_growth = (stars_now - stars_then) / days
+            try:
+                actual_growth = (stars_now - stars_then) / days
+            except (TypeError, ZeroDivisionError):
+                actual_growth = 0.0
 
             # Predicted trajectory: overall_score maps roughly to expected growth
-            predicted_growth = row['growth_rate_predicted'] or max((row['overall_score_at_prediction'] or 0) * 8, 1)
+            predicted_growth = row['growth_rate_predicted'] or _predicted_growth(row['overall_score_at_prediction'])
 
             # Fast-path: star decline or zero growth is always false positive
             if stars_now <= stars_then:

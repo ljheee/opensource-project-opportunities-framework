@@ -28,7 +28,7 @@ class ScoringEngine:
 
         weekly_score = min(weekly_growth / target_weekly, 1.5)
         daily_score = min(daily_absolute / target_daily, 1.5)
-        return min((weekly_score * 0.7 + daily_score * 0.3), 1.0)
+        return max(0.0, min((weekly_score * 0.7 + daily_score * 0.3), 1.0))
 
     def calculate_star_velocity(self, current: int, past_7d: Optional[int],
                                 past_14d: Optional[int] = None,

@@ -104,13 +104,15 @@ def _detect_inflection(star_history: List[Dict]) -> Optional[Dict]:
 
     if slope_recent < 0:
         phase = 'decline'
+        ratio = None
     elif slope_prior <= 0:
-        # Prior was flat/declining, any positive recent is acceleration
+        # Prior was flat/declining, any positive recent is recovery/growth
         phase = 'accelerating' if slope_recent > 0 else 'decline'
+        ratio = None  # ratio is meaningless when prior <= 0
     else:
         # Guard against near-zero slope_prior causing extreme ratios
         safe_slope_prior = max(slope_prior, 0.01)
-        ratio = slope_recent / safe_slope_prior
+        ratio = round(slope_recent / safe_slope_prior, 2)
         if ratio >= 1.5:
             phase = 'accelerating'
         elif ratio >= 0.8:
@@ -124,7 +126,7 @@ def _detect_inflection(star_history: List[Dict]) -> Optional[Dict]:
         'phase': phase,
         'slope_recent': round(slope_recent, 1),
         'slope_prior': round(slope_prior, 1),
-        'ratio': round(slope_recent / max(slope_prior, 0.0001), 2)
+        'ratio': ratio
     }
 
 
@@ -512,11 +514,12 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
             'decline': 'Star growth has stalled or reversed.'
         }.get(phase, '')
 
+        ratio_str = f"{ratio}x" if ratio is not None else "N/A (prior slope <= 0)"
         inflection_lines = [
             f"- Phase: {phase}",
             f"- Recent slope: {slope_r} stars/day",
             f"- Prior slope: {slope_p} stars/day",
-            f"- Ratio (recent/prior): {ratio}x",
+            f"- Ratio (recent/prior): {ratio_str}",
             f"- Assessment: {phase_desc}"
         ]
         inflection_analysis = "\n".join(inflection_lines)
