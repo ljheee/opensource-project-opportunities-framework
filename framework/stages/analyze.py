@@ -383,7 +383,7 @@ def generate_heuristic_analysis(project: Dict) -> Dict:
     if isinstance(topics, str):
         try:
             topics = json.loads(topics)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             topics = []
     if not topics:
         topics = []

@@ -333,7 +333,7 @@ class Database:
             now = datetime.now(timezone.utc).isoformat()
             conn.execute('''
                 INSERT OR REPLACE INTO star_history (project_id, sampled_at, stars)
-                VALUES (?, date(?), ?)
+                VALUES (?, substr(?, 1, 10), ?)
             ''', (project_id, now, stars))
             if should_close:
                 conn.commit()

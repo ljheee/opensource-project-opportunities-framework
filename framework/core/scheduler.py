@@ -89,7 +89,7 @@ class Scheduler:
                     WHERE t.project_id = p.id
                     AND t.status IN ('pending', 'running')
                 )
-                ORDER BY burst_score DESC
+                ORDER BY burst_score DESC, p.stars DESC
                 LIMIT ?
             ''', (date, max_tasks))
 

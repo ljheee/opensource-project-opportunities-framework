@@ -60,14 +60,14 @@ class DiscoverStage:
         if is_search:
             elapsed = time.time() - _last_request_time
             if elapsed < 2:
-                time.sleep(2 - elapsed)
+                time.sleep(max(0, 2 - elapsed))
         else:
             elapsed = time.time() - _last_request_time
             if elapsed < 0.5:
-                time.sleep(0.5 - elapsed)
+                time.sleep(max(0, 0.5 - elapsed))
 
         max_retries = self.resilience.get('github_api', {}).get('max_retries', 3)
-        retry_delay = self.resilience.get('github_api', {}).get('retry_delay_seconds', 60)
+        retry_delay = max(self.resilience.get('github_api', {}).get('retry_delay_seconds', 60), 0)
         if max_retries < 1:
             max_retries = 1
 
@@ -92,7 +92,7 @@ class DiscoverStage:
                     continue
 
                 if response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', 60))
+                    retry_after = max(int(response.headers.get('Retry-After', 60)), 0)
                     print(f"  Too many requests. Waiting {retry_after}s...")
                     time.sleep(min(retry_after, retry_delay))
                     if attempt >= max_retries - 1:
@@ -138,7 +138,7 @@ class DiscoverStage:
                 stale_cutoff = datetime.now(timezone.utc) - timedelta(days=180)
                 if pushed_dt < stale_cutoff:
                     return True, f"stale_since:{pushed[:10]}"
-            except Exception:
+            except (ValueError, TypeError):
                 pass
 
         # Check skip patterns
@@ -312,7 +312,7 @@ class DiscoverStage:
             novelty_score = self.scoring.calculate_novelty(
                 proj['first_commit_at'] or proj['created_at'], 1
             )
-            buzz_score = 0.3
+            buzz_score = self.scoring.default_buzz_score()
 
             result = self.scoring.calculate_overall(
                 velocity_score, activity_score, buzz_score, novelty_score

@@ -81,7 +81,7 @@ class ScoringEngine:
             if first_commit.tzinfo is None:
                 first_commit = first_commit.replace(tzinfo=timezone.utc)
             months_old = (datetime.now(timezone.utc) - first_commit).days / 30
-        except Exception:
+        except (ValueError, TypeError):
             return 0.5
 
         threshold = self._thresholds('novelty_signal')
@@ -93,6 +93,10 @@ class ScoringEngine:
         contrib_score = min(unique_contributors_weekly / contrib_threshold, 1.0) if contrib_threshold > 0 else 0
 
         return min(age_score * 0.6 + contrib_score * 0.4, 1.0)
+
+    def default_buzz_score(self) -> float:
+        """Return default community buzz score when data is unavailable."""
+        return self._thresholds('community_buzz').get('default_score', 0.3)
 
     def calculate_overall(self, star_velocity: float, activity: float,
                           buzz: float, novelty: float) -> Dict[str, Any]:

@@ -39,7 +39,7 @@ class ReportGenerator:
 
             # Get summary stats
             total_projects = conn.execute(
-                "SELECT COUNT(*) FROM projects WHERE date(first_seen_at) <= ? OR first_seen_at IS NULL",
+                "SELECT COUNT(*) FROM projects WHERE COALESCE(substr(first_seen_at, 1, 10), '') <= ? OR first_seen_at IS NULL",
                 (date,)
             ).fetchone()[0]
 
@@ -48,7 +48,7 @@ class ReportGenerator:
             ).fetchone()[0]
 
             total_analyzed = conn.execute(
-                "SELECT COUNT(DISTINCT project_id) FROM analyses WHERE date(analyzed_at) = ?",
+                "SELECT COUNT(DISTINCT project_id) FROM analyses WHERE substr(analyzed_at, 1, 10) = ?",
                 (date,)
             ).fetchone()[0]
 

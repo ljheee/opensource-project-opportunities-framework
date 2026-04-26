@@ -73,7 +73,7 @@ def classify_project_heuristic(project: dict) -> tuple:
     if isinstance(topics, str):
         try:
             topics = json.loads(topics)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             topics = []
     if not topics:
         topics = []
