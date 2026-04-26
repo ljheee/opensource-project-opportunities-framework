@@ -157,7 +157,13 @@ def compute_threshold_optimization(rows):
 
 
 def propose_new_weights(current_weights: dict, comp_corr: dict):
-    """Propose new weights based on discriminative power."""
+    """Propose new weights based on discriminative power.
+
+    Falls back to current weights if comp_corr is empty or incomplete.
+    """
+    if not comp_corr or any(comp not in comp_corr for comp in COMPONENTS):
+        return dict(current_weights)
+
     # Base new weights on discriminative_power (shifted to be all positive)
     powers = {comp: comp_corr[comp]['discriminative_power'] for comp in COMPONENTS}
     min_power = min(powers.values())

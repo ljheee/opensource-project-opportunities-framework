@@ -125,17 +125,22 @@ def classify_project_heuristic(project: dict) -> tuple:
                 tech_layer = layer
             break
 
-    # Application classification
+    # Application classification (whole-word to avoid substring false positives)
     application = 'multimodal'  # default
-    if any(kw in topics_str or kw in desc for kw in ['code', 'coding', 'programming', 'developer']):
+    if any(_is_whole_word(topics_str, kw) or _is_whole_word(desc, kw)
+           for kw in ['code', 'coding', 'programming', 'developer']):
         application = 'code_generation'
-    elif any(kw in topics_str or kw in desc for kw in ['image', 'diffusion', 'stable-diffusion', 'vision']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(desc, kw)
+             for kw in ['image', 'diffusion', 'stable-diffusion', 'vision']):
         application = 'image_generation'
-    elif any(kw in topics_str or kw in desc for kw in ['agent', 'autonomous', 'bot']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(desc, kw)
+             for kw in ['agent', 'autonomous', 'bot']):
         application = 'agent'
-    elif any(kw in topics_str or kw in desc for kw in ['data', 'annotation', 'label', 'dataset']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(desc, kw)
+             for kw in ['data', 'annotation', 'label', 'dataset']):
         application = 'data_annotation'
-    elif any(kw in topics_str or kw in desc for kw in ['eval', 'benchmark', 'safety', 'test']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(desc, kw)
+             for kw in ['eval', 'benchmark', 'safety', 'test']):
         application = 'model_evaluation'
 
     return True, tech_layer, application, 'valid_ai_project'
