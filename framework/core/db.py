@@ -198,7 +198,8 @@ class Database:
                 started_at TEXT,
                 finished_at TEXT,
                 early_burst_score REAL,
-                opportunities_found INTEGER
+                opportunities_found INTEGER,
+                UNIQUE(project_id, task_date, task_type)
             )
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_tasks_date ON tasks(task_date, status)')
@@ -325,17 +326,20 @@ class Database:
         finally:
             conn.close()
 
-    def sample_star_count(self, project_id: str, stars: int):
-        conn = self.get_conn()
+    def sample_star_count(self, project_id: str, stars: int, conn=None):
+        should_close = conn is None
+        conn = conn or self.get_conn()
         try:
             now = datetime.now(timezone.utc).isoformat()
             conn.execute('''
                 INSERT OR REPLACE INTO star_history (project_id, sampled_at, stars)
                 VALUES (?, date(?), ?)
             ''', (project_id, now, stars))
-            conn.commit()
+            if should_close:
+                conn.commit()
         finally:
-            conn.close()
+            if should_close:
+                conn.close()
 
     def get_project_star_history(self, project_id: str, days: int = 30) -> List[Dict]:
         conn = self.get_conn()

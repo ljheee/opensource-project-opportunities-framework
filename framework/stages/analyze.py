@@ -495,29 +495,30 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
     analyzed = 0
     total_opportunities = 0
 
-    def _set_project_status(status: str):
-        conn = db.get_conn()
-        try:
-            conn.execute("UPDATE projects SET status=? WHERE id=?", (status, project_id))
-            conn.commit()
-        finally:
-            conn.close()
-
     for task in tasks:
         project_id = task['project_id']
         print(f"\nAnalyzing: {project_id}")
 
-        # Mark task as running and project as analyzing
-        scheduler.mark_task_running(task['id'])
-        _set_project_status('analyzing')
-
+        conn = db.get_conn()
         try:
+            # Save previous status for recovery on failure
+            prev_status_row = conn.execute(
+                "SELECT status FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            previous_status = prev_status_row['status'] if prev_status_row else 'scheduled'
+
+            # Mark task as running and project as analyzing (same transaction)
+            scheduler.mark_task_running(task['id'], conn=conn)
+            conn.execute("UPDATE projects SET status='analyzing' WHERE id=?", (project_id,))
+            conn.commit()
+
             # Get project data
             project = get_project_data(db, project_id)
             if not project:
                 print(f"  Project not found: {project_id}")
-                scheduler.mark_task_failed(task['id'], 'project_not_found')
-                _set_project_status('scheduled')
+                scheduler.mark_task_failed(task['id'], 'project_not_found', conn=conn)
+                conn.execute("UPDATE projects SET status=? WHERE id=?", (previous_status, project_id))
+                conn.commit()
                 continue
 
             # Generate analysis
@@ -533,9 +534,10 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
             # Store analysis and opportunities atomically
             opportunities_count = store_analysis_and_opportunities(db, project_id, analysis)
 
-            # Mark task complete and project as active
-            scheduler.mark_task_done(task['id'], opportunities_count)
-            _set_project_status('active')
+            # Mark task complete and project as active (same transaction)
+            scheduler.mark_task_done(task['id'], opportunities_count, conn=conn)
+            conn.execute("UPDATE projects SET status='active' WHERE id=?", (project_id,))
+            conn.commit()
 
             analyzed += 1
             total_opportunities += opportunities_count
@@ -544,11 +546,14 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
 
         except Exception as e:
             print(f"  Error analyzing {project_id}: {e}")
-            scheduler.mark_task_failed(task['id'], str(e)[:100])
             try:
-                _set_project_status('scheduled')
+                scheduler.mark_task_failed(task['id'], str(e)[:100], conn=conn)
+                conn.execute("UPDATE projects SET status=? WHERE id=?", (previous_status, project_id))
+                conn.commit()
             except Exception as status_err:
                 print(f"  Warning: Could not reset project status: {status_err}")
+        finally:
+            conn.close()
 
     print(f"\nAnalyzed {analyzed} projects, found {total_opportunities} opportunities")
     return analyzed

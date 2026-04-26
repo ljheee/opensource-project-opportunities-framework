@@ -175,7 +175,7 @@ class DiscoverStage:
 
             # Check if project exists and get current metadata for change detection
             existing = conn.execute(
-                'SELECT topics, description, status FROM projects WHERE id = ?', (project_id,)
+                'SELECT topics, description, status, filter_reason FROM projects WHERE id = ?', (project_id,)
             ).fetchone()
 
             new_topics = json.dumps(repo.get('topics') or [])
@@ -185,23 +185,28 @@ class DiscoverStage:
                 old_topics = existing['topics'] or '[]'
                 old_desc = existing['description'] or ''
                 old_status = existing['status']
+                old_filter_reason = existing['filter_reason']
                 if old_status in ('active', 'scheduled', 'analyzing'):
                     reset_status = old_status
+                    reset_filter_reason = old_filter_reason
                 elif old_status == 'filtered_skip':
                     metadata_changed = old_topics != new_topics or old_desc != new_desc
                     reset_status = 'discovered' if metadata_changed else 'filtered_skip'
+                    reset_filter_reason = None if metadata_changed else old_filter_reason
                 else:
                     reset_status = 'discovered'
+                    reset_filter_reason = None
             else:
                 reset_status = 'discovered'
+                reset_filter_reason = None
 
             # Insert or update project
             conn.execute('''
                 INSERT INTO projects (
                     id, name, url, language, stars, open_issues, forks,
                     created_at, first_commit_at, last_commit_at, topics, description,
-                    category, source, status, first_seen_at, last_fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    category, source, status, filter_reason, first_seen_at, last_fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     url = excluded.url,
@@ -213,6 +218,7 @@ class DiscoverStage:
                     topics = excluded.topics,
                     description = excluded.description,
                     source = excluded.source,
+                    filter_reason = excluded.filter_reason,
                     last_fetched_at = excluded.last_fetched_at,
                     status = CASE
                         WHEN projects.status IN ('active', 'scheduled', 'analyzing')
@@ -235,6 +241,7 @@ class DiscoverStage:
                 'ai',
                 source,
                 reset_status,
+                reset_filter_reason,
                 now if not existing else None,
                 now
             ))
@@ -250,13 +257,14 @@ class DiscoverStage:
             if should_close:
                 conn.close()
 
-    def _sample_star_count(self, project_id: str, stars: int):
+    def _sample_star_count(self, project_id: str, stars: int, conn=None):
         """Sample current star count for velocity tracking."""
-        self.db.sample_star_count(project_id, stars)
+        self.db.sample_star_count(project_id, stars, conn=conn)
 
-    def _calculate_and_store_burst_score(self, project_id: str):
+    def _calculate_and_store_burst_score(self, project_id: str, conn=None):
         """Calculate early-burst score from sampled data."""
-        conn = self.db.get_conn()
+        should_close = conn is None
+        conn = conn or self.db.get_conn()
         try:
             # Get current project info
             proj = conn.execute(
@@ -266,9 +274,19 @@ class DiscoverStage:
             if not proj:
                 return
 
-            # Get star history
             current_stars = proj['stars'] or 0
-            history = self.db.get_project_star_history(project_id, days=35)
+
+            # Get star history from shared conn if available, else new conn
+            if should_close:
+                history = self.db.get_project_star_history(project_id, days=35)
+            else:
+                cursor = conn.execute('''
+                    SELECT * FROM star_history
+                    WHERE project_id = ?
+                    AND sampled_at >= date('now', '-35 days')
+                    ORDER BY sampled_at DESC
+                ''', (project_id,))
+                history = [dict(row) for row in cursor.fetchall()]
 
             # Find stars from 7d and 30d ago
             stars_7d_ago = None
@@ -323,10 +341,12 @@ class DiscoverStage:
                     'current_stars': current_stars
                 })
             ))
-            conn.commit()
+            if should_close:
+                conn.commit()
 
         finally:
-            conn.close()
+            if should_close:
+                conn.close()
 
     def discover_topics(self) -> List[Dict]:
         """Discover from GitHub topics."""
@@ -530,9 +550,12 @@ class DiscoverStage:
                         item['repo'], item['source'], item['signal'],
                         conn=conn, _upsert_counter=upsert_counter
                     )
-                    conn.commit()  # Ensure project is visible to new connections
-                    self._sample_star_count(project_id, (item.get('repo') or {}).get('stargazers_count') or 0)
-                    self._calculate_and_store_burst_score(project_id)
+                    self._sample_star_count(
+                        project_id,
+                        (item.get('repo') or {}).get('stargazers_count') or 0,
+                        conn=conn
+                    )
+                    self._calculate_and_store_burst_score(project_id, conn=conn)
                     stored_count += 1
                 except Exception as e:
                     repo_name = (item.get('repo') or {}).get('full_name', 'unknown')
@@ -552,8 +575,9 @@ class DiscoverStage:
             ).fetchall()
 
             for proj in active_projects:
-                self._sample_star_count(proj['id'], proj['stars'] or 0)
-                self._calculate_and_store_burst_score(proj['id'])
+                self._sample_star_count(proj['id'], proj['stars'] or 0, conn=conn)
+                self._calculate_and_store_burst_score(proj['id'], conn=conn)
+            conn.commit()
 
             print(f"  Sampled {len(active_projects)} existing projects")
         finally:

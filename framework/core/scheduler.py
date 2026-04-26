@@ -108,38 +108,47 @@ class Scheduler:
         finally:
             conn.close()
 
-    def mark_task_running(self, task_id: int):
+    def mark_task_running(self, task_id: int, conn=None):
         """Mark a task as running."""
-        conn = self.get_conn()
+        should_close = conn is None
+        conn = conn or self.get_conn()
         try:
             conn.execute("""
                 UPDATE tasks SET status = 'running', started_at = ?
                 WHERE id = ?
             """, (datetime.now(timezone.utc).isoformat(), task_id))
-            conn.commit()
+            if should_close:
+                conn.commit()
         finally:
-            conn.close()
+            if should_close:
+                conn.close()
 
-    def mark_task_done(self, task_id: int, opportunities_found: int = 0):
+    def mark_task_done(self, task_id: int, opportunities_found: int = 0, conn=None):
         """Mark a task as completed."""
-        conn = self.get_conn()
+        should_close = conn is None
+        conn = conn or self.get_conn()
         try:
             conn.execute("""
                 UPDATE tasks SET status = 'done', finished_at = ?, opportunities_found = ?
                 WHERE id = ?
             """, (datetime.now(timezone.utc).isoformat(), opportunities_found, task_id))
-            conn.commit()
+            if should_close:
+                conn.commit()
         finally:
-            conn.close()
+            if should_close:
+                conn.close()
 
-    def mark_task_failed(self, task_id: int, error_message: str = None):
+    def mark_task_failed(self, task_id: int, error_message: str = None, conn=None):
         """Mark a task as failed."""
-        conn = self.get_conn()
+        should_close = conn is None
+        conn = conn or self.get_conn()
         try:
             conn.execute("""
                 UPDATE tasks SET status = 'failed', finished_at = ?, trigger_reason = ?
                 WHERE id = ?
             """, (datetime.now(timezone.utc).isoformat(), error_message or 'analysis_failed', task_id))
-            conn.commit()
+            if should_close:
+                conn.commit()
         finally:
-            conn.close()
+            if should_close:
+                conn.close()
