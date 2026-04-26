@@ -47,15 +47,73 @@
     - `true_positive`: 实际增长 >= 预期增长的 50%（预期增长 = overall_score * 8）
     - `false_positive`: 实际增长 < 预期增长的 50%
 
-**学习阶段：**
-- 计算 Precision = TP / (TP + FP)
-- 计算 Score Bucket Calibration：把预测按 overall_score 分桶（0.65-0.7, 0.7-0.8, 0.8+），看各桶的实际 precision
-- 如果高分的桶 precision 反而低，说明模型在"过度自信"
+**学习阶段（四层递进，每层回答不同的问题）：**
+
+为什么需要四层？因为只看一个 overall precision 只能告诉你"系统整体准不准"，但无法告诉你"为什么不准"以及"该优化哪里"。四层像体检：先量体温，再查血常规，再查具体器官，最后开药。
+
+**第一层：Overall Precision（系统整体可信吗？）**
+
+```
+precision = TP / (TP + FP)
+```
+
+这是给用户看的"信心指标"。如果 precision = 60%，意味着每 10 个被标记为 early-burst 的项目，有 6 个确实在后续 7 天内加速了。用户看到这个数字，才有理由信任系统的判断。
+
+**为什么不够？** precision = 60% 可能是"所有分数段都 60%"，也可能是"低分段 30%、高分段 90%"。这两种情况的天壤之别，overall precision 看不出来。
+
+**第二层：Score Bucket Calibration（分数本身有意义吗？）**
+
+把预测按 overall_score 分桶（0.65-0.7 / 0.7-0.8 / 0.8+），看各桶的实际 precision。
+
+| 场景 A（理想） | 场景 B（灾难） |
+|---------------|---------------|
+| 0.8+ precision: 90% | 0.8+ precision: 40% |
+| 0.7-0.8 precision: 70% | 0.7-0.8 precision: 75% |
+| 0.65-0.7 precision: 50% | 0.65-0.7 precision: 55% |
+
+场景 A：分数越高越准，模型在"说真话"。
+场景 B：最高分桶反而最不准，模型在"虚高"——打分系统在 inflated scores，高分项目并没有真的更好。
+
+**场景 B 的深层含义**：某个 component 可能在"作弊"。比如 community_buzz 默认给所有人 0.3，但如果某个项目的 buzz 因为随机因素被高估到 0.8，overall_score 会被虚高，但它并不真的在爆发。
+
+**第三层：Component Correlation（哪个指标在起作用，哪个是废的？）**
+
+对比 TP 和 FP 在四个 component 上的平均分：
+
+```
+                star_velocity  activity  community_buzz  novelty
+TP 平均分:      0.72          0.65      0.31            0.58
+FP 平均分:      0.45          0.62      0.29            0.61
+差异:           +0.27         +0.03     +0.02           -0.03
+```
+
+这个结果告诉我们：**star_velocity 是唯一的有效信号**。TP 项目的 star_velocity 显著高于 FP，其他三个指标没有区分力。
+
+**为什么要找这个？** 因为当前权重是 star_velocity 0.35 / activity 0.25 / buzz 0.25 / novelty 0.15。但实际上 activity、buzz、novelty 加起来占了 65% 的权重，却对预测对错几乎没有影响。这 65% 的权重是在"浪费算力"。
+
+**第四层：Threshold Optimization（门槛设多高最合适？）**
+
+当前 min_score = 0.65，这是拍脑袋的。通过历史数据扫描不同阈值：
+
+| Threshold | Precision | 被保留的预测数 |
+|-----------|-----------|--------------|
+| 0.55      | 45%       | 100%         |
+| 0.65      | 62%       | 68%          |
+| 0.70      | 71%       | 45%          |
+| 0.75      | 78%       | 28%          |
+
+如果用户需要"宁可漏掉也不错杀"，保持 0.65。如果用户需要"宁杀错不放过"，提高到 0.75。
+
+**为什么需要这层？** 因为 precision 和 coverage 是 trade-off。提高门槛 → precision 上升但 coverage 下降（漏掉更多项目）。没有历史数据，这个 trade-off 是盲猜的。
 
 **调整阶段（未来迭代）：**
-- 基于 calibration 结果，调整 `min_score` 阈值
-- 如果某个 score component（如 star_velocity）与 TP/FP 相关性弱，降低其权重
-- 最终目标：实现 weight auto-tuning（自动权重校正）
+
+基于 Learn 阶段的四层输出，决定三件事：
+1. **min_score 调多少** → 由 Threshold Optimization 决定
+2. **哪个 component 降权** → 由 Component Correlation 决定
+3. **降多少** → 保守渐进，单次不超过 ±20%，每月只调一次
+
+最终目标：实现 `reweight.py --dry-run` 输出调整建议，人工确认后 `--apply` 生效。
 
 ### 1.3 报告输出
 

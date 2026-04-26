@@ -22,7 +22,13 @@ You are a senior AI industry analyst with deep technical and strategic expertise
 
 {star_trajectory}
 
-Use this trajectory data to identify inflection points, acceleration/deceleration patterns, and whether the project is in an upward trend, plateau, or decline phase. Do not rely solely on the current star count—focus on the *rate of change* and its trend.
+Use this trajectory data to understand the project's growth pattern. Do not rely solely on the current star count—focus on the *rate of change* and its trend.
+
+## Inflection Point Analysis
+
+{inflection_analysis}
+
+Use this pre-computed inflection signal as a factual anchor. If the phase is "accelerating," investigate what catalyst may have caused the growth rate to double. If "decelerating" or "decline," assess whether this is a natural plateau or a signal of fading momentum.
 
 ## Peer Comparison (Same Category)
 

@@ -133,8 +133,40 @@ class ReportGenerator:
 
             if total_evaluated > 0:
                 precision = tp_count / total_evaluated
-                lines.append(f"- **Predictions evaluated:** {total_evaluated}")
-                lines.append(f"- **Precision (7d+ horizon):** {precision:.1%} ({tp_count} TP / {fp_count} FP)")
+                avg_tp = conn.execute('''
+                    SELECT AVG(growth_rate_actual) FROM prediction_outcomes
+                    WHERE outcome = 'true_positive'
+                ''').fetchone()[0] or 0
+                avg_fp = conn.execute('''
+                    SELECT AVG(growth_rate_actual) FROM prediction_outcomes
+                    WHERE outcome = 'false_positive'
+                ''').fetchone()[0] or 0
+                lines.append(f"- **Predictions evaluated:** {total_evaluated} (TP: {tp_count}, FP: {fp_count})")
+                lines.append(f"- **Precision (7d+ horizon):** {precision:.1%}")
+                lines.append(f"- **Avg actual growth — TP:** {avg_tp:.1f} stars/day, FP: {avg_fp:.1f} stars/day")
+
+                # Score bucket calibration table
+                buckets = conn.execute('''
+                    SELECT
+                        CASE
+                            WHEN overall_score_at_prediction >= 0.8 THEN '0.8+'
+                            WHEN overall_score_at_prediction >= 0.7 THEN '0.7-0.8'
+                            WHEN overall_score_at_prediction >= 0.65 THEN '0.65-0.7'
+                            ELSE '<0.65'
+                        END as bucket,
+                        COUNT(*) as total,
+                        SUM(CASE WHEN outcome = 'true_positive' THEN 1 ELSE 0 END) as tp_count
+                    FROM prediction_outcomes
+                    WHERE outcome != 'pending'
+                    GROUP BY bucket
+                    ORDER BY overall_score_at_prediction DESC
+                ''').fetchall()
+
+                if buckets:
+                    lines.extend(["", "### Score Bucket Calibration", "", "| Bucket | Evaluated | Precision |", "|--------|-----------|-----------|"])
+                    for b in buckets:
+                        b_prec = b['tp_count'] / b['total'] if b['total'] > 0 else 0
+                        lines.append(f"| {b['bucket']} | {b['total']} | {b_prec:.1%} |")
             else:
                 lines.append("_No predictions have matured enough for evaluation._")
 

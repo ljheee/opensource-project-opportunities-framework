@@ -40,6 +40,92 @@ def _is_whole_word(text: str, pattern: str) -> bool:
     return False
 
 
+def _calculate_peer_percentile(project_stars: int, peers: List[Dict]) -> tuple[float, int, int]:
+    """Calculate star count percentile within peer group.
+
+    Returns (percentile, peers_below, total_peers).
+    """
+    if not peers:
+        return 0.0, 0, 0
+    peer_stars = [p.get('stars', 0) or 0 for p in peers]
+    total = len(peer_stars)
+    below = sum(1 for s in peer_stars if project_stars > s)
+    # If tied with highest, treat as 100th percentile
+    if project_stars >= max(peer_stars):
+        return 100.0, below, total
+    percentile = (below / total) * 100
+    return percentile, below, total
+
+
+def _detect_inflection(star_history: List[Dict]) -> Optional[Dict]:
+    """Detect growth phase from star history trajectory.
+
+    Returns None if insufficient data, otherwise dict with:
+    - phase: accelerating | stable_growth | decelerating | decline
+    - slope_recent: stars/day in recent period
+    - slope_prior: stars/day in prior period
+    - ratio: slope_recent / slope_prior
+    """
+    if len(star_history) < 3:
+        return None
+
+    # Sort ascending by date
+    sorted_hist = sorted(star_history, key=lambda x: x.get('sampled_at', ''))
+
+    # Split into two halves: prior (first half) and recent (second half)
+    mid_idx = len(sorted_hist) // 2
+    prior = sorted_hist[:mid_idx + 1]  # include midpoint
+    recent = sorted_hist[mid_idx:]
+
+    if len(prior) < 2 or len(recent) < 2:
+        return None
+
+    earliest = prior[0]
+    mid = prior[-1]
+    latest = recent[-1]
+
+    def days_between(a, b):
+        try:
+            da = datetime.fromisoformat(a['sampled_at'].replace('Z', '+00:00'))
+            db = datetime.fromisoformat(b['sampled_at'].replace('Z', '+00:00'))
+            return max((db - da).total_seconds() / 86400, 1.0)
+        except (ValueError, TypeError, KeyError):
+            return 1.0
+
+    days_prior = days_between(earliest, mid)
+    days_recent = days_between(mid, latest)
+
+    stars_earliest = earliest.get('stars', 0) or 0
+    stars_mid = mid.get('stars', 0) or 0
+    stars_latest = latest.get('stars', 0) or 0
+
+    slope_prior = (stars_mid - stars_earliest) / days_prior
+    slope_recent = (stars_latest - stars_mid) / days_recent
+
+    if slope_recent < 0:
+        phase = 'decline'
+    elif slope_prior <= 0:
+        # Prior was flat/declining, any positive recent is acceleration
+        phase = 'accelerating' if slope_recent > 0 else 'decline'
+    else:
+        ratio = slope_recent / slope_prior
+        if ratio >= 1.5:
+            phase = 'accelerating'
+        elif ratio >= 0.8:
+            phase = 'stable_growth'
+        elif ratio >= 0.5:
+            phase = 'decelerating'
+        else:
+            phase = 'decelerating'
+
+    return {
+        'phase': phase,
+        'slope_recent': round(slope_recent, 1),
+        'slope_prior': round(slope_prior, 1),
+        'ratio': round(slope_recent / max(slope_prior, 0.0001), 2)
+    }
+
+
 def get_project_data(db: Database, project_id: str, conn=None) -> Optional[Dict]:
     """Get project and burst signal data."""
     should_close = conn is None
@@ -84,6 +170,17 @@ def get_project_data(db: Database, project_id: str, conn=None) -> Optional[Dict]
             proj_dict.get('application'),
             limit=5,
             conn=conn
+        )
+
+        # Calculate peer percentile
+        proj_dict['peer_percentile'] = _calculate_peer_percentile(
+            proj_dict.get('stars', 0) or 0,
+            proj_dict.get('peers', [])
+        )
+
+        # Detect inflection point from star history
+        proj_dict['inflection'] = _detect_inflection(
+            proj_dict.get('star_history', [])
         )
 
         return proj_dict
@@ -384,6 +481,7 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
 
     # Format peer comparison for competitive context
     peers = project.get('peers', [])
+    percentile, below, total = project.get('peer_percentile', (0.0, 0, 0))
     if peers:
         peer_lines = ["| Project | Stars | URL |"]
         peer_lines.append("|---------|-------|-----|")
@@ -392,9 +490,39 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
             peer_stars = peer.get('stars') or 0
             peer_url = peer.get('url') or 'N/A'
             peer_lines.append(f"| {peer_name} | {peer_stars} | {peer_url} |")
+        peer_lines.append("")
+        peer_lines.append(
+            f"Percentile in peer group: {percentile:.0f}% (above {below} of {total} peers)"
+        )
         peer_comparison = "\n".join(peer_lines)
     else:
         peer_comparison = "_No peer projects found in this category._"
+
+    # Format inflection point analysis
+    inflection = project.get('inflection')
+    if inflection:
+        phase = inflection['phase']
+        slope_r = inflection['slope_recent']
+        slope_p = inflection['slope_prior']
+        ratio = inflection['ratio']
+
+        phase_desc = {
+            'accelerating': 'Growth rate has accelerated significantly.',
+            'stable_growth': 'Growth is steady and consistent.',
+            'decelerating': 'Growth rate is slowing down.',
+            'decline': 'Star growth has stalled or reversed.'
+        }.get(phase, '')
+
+        inflection_lines = [
+            f"- Phase: {phase}",
+            f"- Recent slope: {slope_r} stars/day",
+            f"- Prior slope: {slope_p} stars/day",
+            f"- Ratio (recent/prior): {ratio}x",
+            f"- Assessment: {phase_desc}"
+        ]
+        inflection_analysis = "\n".join(inflection_lines)
+    else:
+        inflection_analysis = "_Insufficient star history data for inflection analysis._"
 
     prompt = _format_prompt(prompt_template, {
         'name': project.get('name') or 'Unknown',
@@ -409,6 +537,7 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
         'novelty': (project.get('burst_signals') or {}).get('novelty_score') or 'N/A',
         'star_trajectory': star_trajectory,
         'peer_comparison': peer_comparison,
+        'inflection_analysis': inflection_analysis,
     })
 
     try:

@@ -21,7 +21,9 @@ def record_new_predictions(db: Database):
         # Find latest early-burst signal per project where is_early_burst=1
         # and no prediction_outcome record exists yet
         cur = conn.execute('''
-            SELECT e.project_id, e.calculated_at, e.overall_score, p.stars
+            SELECT e.project_id, e.calculated_at, e.overall_score, p.stars,
+                   e.star_velocity_score, e.activity_index_score,
+                   e.community_buzz_score, e.novelty_score
             FROM early_burst_signals e
             JOIN projects p ON e.project_id = p.id
             JOIN (
@@ -42,10 +44,15 @@ def record_new_predictions(db: Database):
             conn.execute('''
                 INSERT INTO prediction_outcomes
                 (project_id, predicted_at, stars_at_prediction,
-                 overall_score_at_prediction, checked_at, outcome)
-                VALUES (?, ?, ?, ?, date('now'), 'pending')
+                 overall_score_at_prediction,
+                 star_velocity_at_pred, activity_index_at_pred,
+                 community_buzz_at_pred, novelty_at_pred,
+                 checked_at, outcome)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, date('now'), 'pending')
             ''', (row['project_id'], row['calculated_at'],
-                  row['stars'], row['overall_score']))
+                  row['stars'], row['overall_score'],
+                  row['star_velocity_score'], row['activity_index_score'],
+                  row['community_buzz_score'], row['novelty_score']))
             recorded += 1
 
         conn.commit()

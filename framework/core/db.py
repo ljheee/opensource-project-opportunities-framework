@@ -36,6 +36,15 @@ class Database:
         self._add_column_if_missing(conn, 'projects', 'prev_stars', 'INTEGER')
         self._add_column_if_missing(conn, 'projects', 'prev_open_issues', 'INTEGER')
 
+    def _migrate_prediction_outcomes(self, conn):
+        """Migrate prediction_outcomes table: add component score columns."""
+        if not self._table_exists(conn, 'prediction_outcomes'):
+            return
+        self._add_column_if_missing(conn, 'prediction_outcomes', 'star_velocity_at_pred', 'REAL')
+        self._add_column_if_missing(conn, 'prediction_outcomes', 'activity_index_at_pred', 'REAL')
+        self._add_column_if_missing(conn, 'prediction_outcomes', 'community_buzz_at_pred', 'REAL')
+        self._add_column_if_missing(conn, 'prediction_outcomes', 'novelty_at_pred', 'REAL')
+
     def _migrate_analyses(self, conn):
         """Migrate analyses table: add missing columns and CHECK constraint via table rebuild."""
         # Crash recovery first: handle interrupted migration from previous run
@@ -126,6 +135,7 @@ class Database:
             self._create_analyses(conn)
             self._create_opportunities(conn)
             self._create_prediction_outcomes(conn)
+            self._migrate_prediction_outcomes(conn)
             conn.commit()
         finally:
             conn.close()
@@ -260,6 +270,10 @@ class Database:
                 predicted_at TEXT,
                 stars_at_prediction INTEGER,
                 overall_score_at_prediction REAL,
+                star_velocity_at_pred REAL,
+                activity_index_at_pred REAL,
+                community_buzz_at_pred REAL,
+                novelty_at_pred REAL,
                 checked_at TEXT,
                 stars_now INTEGER,
                 growth_rate_actual REAL,
