@@ -31,7 +31,7 @@ def main():
         count = scheduler.generate_bulk_tasks(today, args.batch_size)
     else:
         scheduling_cfg = config.get_scheduling_config()
-        incremental_cfg = scheduling_cfg.get('incremental', {}) if scheduling_cfg else {}
+        incremental_cfg = scheduling_cfg.get('incremental', {})
         max_tasks = incremental_cfg.get('max_per_day', 15)
         count = scheduler.generate_incremental_tasks(today, max_tasks)
 

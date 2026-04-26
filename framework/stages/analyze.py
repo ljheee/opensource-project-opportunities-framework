@@ -382,13 +382,13 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
 
                 return analysis
 
-            except Exception as e:
+            except (subprocess.SubprocessError, OSError) as e:
                 print(f"  Error calling LLM (attempt {attempt}/{max_retries}): {e}")
                 if attempt < max_retries:
                     continue
                 return None
 
-    except Exception as e:
+    except (OSError, ValueError) as e:
         print(f"  Error calling LLM: {e}")
         return None
 

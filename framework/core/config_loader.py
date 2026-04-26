@@ -47,10 +47,10 @@ class ConfigLoader:
         return self._config
 
     def _require_key(self, key: str):
-        val = self.load().get(key)
-        if val is None:
+        cfg = self.load()
+        if key not in cfg:
             raise RuntimeError(f"Missing required config key: '{key}'")
-        return val
+        return cfg[key]
 
     def get_category(self) -> CategoryConfig:
         cat = self._require_key('category')
@@ -68,13 +68,25 @@ class ConfigLoader:
         return EarlyBurstConfig(**eb)
 
     def get_github_topics(self) -> List[str]:
-        return self.load().get('sources', {}).get('github', {}).get('topics', [])
+        topics = self.load().get('sources', {}).get('github', {}).get('topics', [])
+        return topics if isinstance(topics, list) else []
 
     def get_star_range(self) -> tuple:
-        return tuple(self.load().get('sources', {}).get('github', {}).get('star_range', [50, 50000]))
+        raw = self.load().get('sources', {}).get('github', {}).get('star_range', [50, 50000])
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            return (50, 50000)
+        try:
+            min_val = int(raw[0])
+            max_val = int(raw[1])
+        except (ValueError, TypeError):
+            return (50, 50000)
+        if min_val < 0 or max_val < 0 or min_val > max_val:
+            return (50, 50000)
+        return (min_val, max_val)
 
     def get_ecosystems(self) -> List[str]:
-        return self.load().get('sources', {}).get('ecosystems', [])
+        ecosystems = self.load().get('sources', {}).get('ecosystems', [])
+        return ecosystems if isinstance(ecosystems, list) else []
 
     def get_filters(self) -> Dict:
         return self.load().get('filters', {})

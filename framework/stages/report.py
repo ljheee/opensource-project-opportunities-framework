@@ -76,7 +76,7 @@ class ReportGenerator:
                 SELECT o.*, p.name as project_name, p.url as project_url, a.overall_score
                 FROM opportunities o
                 JOIN projects p ON o.project_id = p.id
-                JOIN (
+                LEFT JOIN (
                     SELECT project_id, overall_score,
                            ROW_NUMBER() OVER (
                                PARTITION BY project_id ORDER BY analyzed_at DESC

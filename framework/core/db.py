@@ -342,7 +342,7 @@ class Database:
             now = datetime.now(timezone.utc).isoformat()
             conn.execute('''
                 INSERT INTO star_history (project_id, sampled_at, stars)
-                VALUES (?, substr(?, 1, 10), ?)
+                VALUES (?, date(?), ?)
                 ON CONFLICT(project_id, sampled_at) DO UPDATE SET
                     stars = excluded.stars
             ''', (project_id, now, stars))

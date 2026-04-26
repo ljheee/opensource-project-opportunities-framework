@@ -6,6 +6,7 @@ Classifies discovered projects using heuristics and updates their status.
 import os
 import sys
 import json
+import sqlite3
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -55,7 +56,7 @@ def update_project_status(db: Database, project_id: str, status: str,
                 WHERE id=?
             """, (filter_reason, project_id))
         conn.commit()
-    except Exception as e:
+    except sqlite3.Error as e:
         conn.rollback()
         raise e
     finally:
@@ -162,7 +163,7 @@ def run_filter(db: Database, dry_run: bool = False):
                 skipped += 1
 
             processed += 1
-        except Exception as e:
+        except (sqlite3.Error, ValueError, TypeError) as e:
             print(f"  Error processing {proj['id']}: {e}")
 
     print(f"\nProcessed {processed} projects: {kept} kept, {skipped} skipped")

@@ -211,7 +211,9 @@ class DiscoverStage:
                     name = excluded.name,
                     url = excluded.url,
                     language = excluded.language,
+                    prev_stars = projects.stars,
                     stars = excluded.stars,
+                    prev_open_issues = projects.open_issues,
                     open_issues = excluded.open_issues,
                     forks = excluded.forks,
                     last_commit_at = excluded.last_commit_at,
@@ -486,7 +488,7 @@ class DiscoverStage:
                                 })
                         except GitHubAPIError:
                             pass
-                except Exception as e:
+                except requests.exceptions.RequestException as e:
                     print(f"  trending_error {lang}/{period}: {e}")
                 time.sleep(1)
 
@@ -570,12 +572,17 @@ class DiscoverStage:
                 "SELECT id, stars FROM projects WHERE status IN ('scheduled', 'active')"
             ).fetchall()
 
+            sampled = 0
             for proj in active_projects:
-                self._sample_star_count(proj['id'], proj['stars'] or 0, conn=conn)
-                self._calculate_and_store_burst_score(proj['id'], conn=conn)
+                try:
+                    self._sample_star_count(proj['id'], proj['stars'] or 0, conn=conn)
+                    self._calculate_and_store_burst_score(proj['id'], conn=conn)
+                    sampled += 1
+                except Exception as e:
+                    print(f"  Error sampling {proj['id']}: {e}")
             conn.commit()
 
-            print(f"  Sampled {len(active_projects)} existing projects")
+            print(f"  Sampled {sampled}/{len(active_projects)} existing projects")
         finally:
             conn.close()
 

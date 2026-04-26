@@ -8,12 +8,10 @@ class ScoringEngine:
         self.config = config
 
     def _thresholds(self, metric_name: str) -> Dict:
-        metrics = getattr(self.config, 'metrics', {})
-        return metrics.get(metric_name, {}).get('thresholds', {})
+        return self.config.metrics.get(metric_name, {}).get('thresholds', {})
 
     def _weight(self, metric_name: str) -> float:
-        metrics = getattr(self.config, 'metrics', {})
-        return metrics.get(metric_name, {}).get('weight', 0.25)
+        return self.config.metrics.get(metric_name, {}).get('weight', 0.25)
 
     def calculate_star_velocity(self, current: int, past_7d: Optional[int],
                                 past_30d: Optional[int]) -> float:
@@ -113,5 +111,5 @@ class ScoringEngine:
             'community_buzz_score': buzz,
             'novelty_score': novelty,
             'overall_score': overall,
-            'is_early_burst': overall >= getattr(self.config, 'min_score', 0.65)
+            'is_early_burst': overall >= self.config.min_score
         }
