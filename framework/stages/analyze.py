@@ -65,6 +65,18 @@ def get_project_data(db: Database, project_id: str, conn=None) -> Optional[Dict]
         if signals:
             proj_dict['burst_signals'] = dict(signals)
 
+        # Get star history for trajectory analysis (shared conn if available)
+        if conn:
+            cursor = conn.execute('''
+                SELECT sampled_at, stars FROM star_history
+                WHERE project_id = ?
+                AND sampled_at >= date('now', '-30 days')
+                ORDER BY sampled_at ASC
+            ''', (project_id,))
+            proj_dict['star_history'] = [dict(row) for row in cursor.fetchall()]
+        else:
+            proj_dict['star_history'] = db.get_project_star_history(project_id, days=30)
+
         return proj_dict
     finally:
         if should_close:
@@ -341,6 +353,26 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
     if isinstance(topics, list):
         topics = json.dumps(topics)
 
+    # Format star history trajectory for the prompt
+    star_history = project.get('star_history', [])
+    if star_history and len(star_history) >= 2:
+        traj_lines = ["| Date | Stars | Weekly Gain |"]
+        traj_lines.append("|------|-------|-------------|")
+        prev_stars = None
+        for entry in star_history:
+            date_str = entry.get('sampled_at', 'N/A')[:10]
+            stars = entry.get('stars', 0)
+            if prev_stars is not None and prev_stars > 0:
+                gain = stars - prev_stars
+                pct = f"{gain:+d} ({gain/prev_stars*100:+.1f}%)"
+            else:
+                pct = "—"
+            traj_lines.append(f"| {date_str} | {stars} | {pct} |")
+            prev_stars = stars
+        star_trajectory = "\n".join(traj_lines)
+    else:
+        star_trajectory = "_No star history data available._"
+
     prompt = _format_prompt(prompt_template, {
         'name': project.get('name') or 'Unknown',
         'url': project.get('url') or 'N/A',
@@ -352,6 +384,7 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
         'star_velocity': (project.get('burst_signals') or {}).get('star_velocity_score') or 'N/A',
         'activity_index': (project.get('burst_signals') or {}).get('activity_index_score') or 'N/A',
         'novelty': (project.get('burst_signals') or {}).get('novelty_score') or 'N/A',
+        'star_trajectory': star_trajectory,
     })
 
     try:

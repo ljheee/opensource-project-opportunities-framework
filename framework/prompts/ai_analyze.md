@@ -18,6 +18,12 @@ You are a senior AI industry analyst with deep technical and strategic expertise
 - **Activity Index:** {activity_index}
 - **Novelty:** {novelty}
 
+## Star Trajectory (last 30 days)
+
+{star_trajectory}
+
+Use this trajectory data to identify inflection points, acceleration/deceleration patterns, and whether the project is in an upward trend, plateau, or decline phase. Do not rely solely on the current star count—focus on the *rate of change* and its trend.
+
 ## Analysis Instructions
 
 Think deeply about this project. Go beyond surface-level observations. Ask yourself:

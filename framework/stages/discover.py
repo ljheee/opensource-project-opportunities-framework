@@ -298,8 +298,10 @@ class DiscoverStage:
                 ''', (project_id,))
                 history = [dict(row) for row in cursor.fetchall()]
 
-            # Find stars from 7d and 30d ago
+            # Find stars from 7d, 14d, 21d and 30d ago
             stars_7d_ago = None
+            stars_14d_ago = None
+            stars_21d_ago = None
             stars_30d_ago = None
 
             now = datetime.now(timezone.utc)
@@ -312,12 +314,16 @@ class DiscoverStage:
 
                 if 6 <= days_ago <= 8 and stars_7d_ago is None:
                     stars_7d_ago = sample['stars']
+                if 13 <= days_ago <= 15 and stars_14d_ago is None:
+                    stars_14d_ago = sample['stars']
+                if 20 <= days_ago <= 22 and stars_21d_ago is None:
+                    stars_21d_ago = sample['stars']
                 if 28 <= days_ago <= 32 and stars_30d_ago is None:
                     stars_30d_ago = sample['stars']
 
-            # Calculate scores
+            # Calculate scores (acceleration-aware when 14d+ data exists)
             velocity_score = self.scoring.calculate_star_velocity(
-                current_stars, stars_7d_ago, stars_30d_ago
+                current_stars, stars_7d_ago, stars_14d_ago, stars_21d_ago, stars_30d_ago
             )
             # Estimate commit frequency from last push date (pushed_at -> last_commit_at)
             last_commit = proj['last_commit_at'] or ''

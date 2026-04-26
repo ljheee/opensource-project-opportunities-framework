@@ -13,34 +13,79 @@ class ScoringEngine:
     def _weight(self, metric_name: str) -> float:
         return self.config.metrics.get(metric_name, {}).get('weight', 0.25)
 
-    def calculate_star_velocity(self, current: int, past_7d: Optional[int],
-                                past_30d: Optional[int]) -> float:
+    def _volume_score(self, current: int, past: int, days: int) -> float:
+        """Raw volume score for a given lookback period."""
         threshold = self._thresholds('star_velocity')
         target_weekly = max(threshold.get('weekly_growth_rate', 0.15), 0.0001)
         target_daily = max(threshold.get('daily_absolute', 10), 0.0001)
 
-        # Primary: 7-day velocity
-        if past_7d is not None and current > past_7d:
-            if past_7d > 0:
-                weekly_growth = (current - past_7d) / past_7d
-                daily_absolute = (current - past_7d) / 7
-                weekly_score = min(weekly_growth / target_weekly, 1.5)
-                daily_score = min(daily_absolute / target_daily, 1.5)
-                return min((weekly_score * 0.7 + daily_score * 0.3), 1.0)
-            else:
-                # 0 -> N stars: maximum early-burst signal
-                return 1.0
+        if past > 0:
+            weekly_growth = ((current - past) / past) / (days / 7)
+            daily_absolute = (current - past) / days
+        else:
+            # 0 -> N stars: maximum velocity signal
+            return 1.0
 
-        # Fallback: 30-day velocity (normalize weekly growth by 4.3 weeks)
+        weekly_score = min(weekly_growth / target_weekly, 1.5)
+        daily_score = min(daily_absolute / target_daily, 1.5)
+        return min((weekly_score * 0.7 + daily_score * 0.3), 1.0)
+
+    def calculate_star_velocity(self, current: int, past_7d: Optional[int],
+                                past_14d: Optional[int] = None,
+                                past_21d: Optional[int] = None,
+                                past_30d: Optional[int] = None) -> float:
+        """
+        Calculate star velocity with optional acceleration awareness.
+
+        When past_14d (and optionally past_21d) are provided, the score
+        blends absolute volume (60%) with week-over-week acceleration (40%).
+        """
+        # Primary: 7-day velocity (volume)
+        if past_7d is not None and current > past_7d:
+            volume_score = self._volume_score(current, past_7d, 7)
+
+            # Acceleration: compare recent week to previous week
+            if past_14d is not None:
+                delta_w1 = current - past_7d
+                delta_w2 = past_7d - past_14d
+
+                if delta_w1 > 0 and delta_w2 > 0:
+                    ratio = delta_w1 / delta_w2
+                    # Map ratio to acceleration score
+                    if ratio >= 2.0:
+                        acceleration_score = 1.0
+                    elif ratio >= 1.5:
+                        acceleration_score = 0.85
+                    elif ratio >= 1.0:
+                        acceleration_score = 0.65
+                    elif ratio >= 0.5:
+                        acceleration_score = 0.4
+                    else:
+                        acceleration_score = 0.2
+                elif delta_w1 > 0 and delta_w2 <= 0:
+                    # Growth starting from flatline → high acceleration signal
+                    acceleration_score = 0.9
+                else:
+                    acceleration_score = 0.3
+
+                # Optional: 3-week trend confirmation
+                if past_21d is not None:
+                    delta_w3 = past_14d - past_21d
+                    if delta_w3 > 0:
+                        # If all three weeks show accelerating growth, boost
+                        if delta_w1 > delta_w2 > delta_w3:
+                            acceleration_score = min(acceleration_score + 0.1, 1.0)
+                        # If decelerating across 3 weeks, penalize
+                        elif delta_w1 < delta_w2 < delta_w3:
+                            acceleration_score = max(acceleration_score - 0.15, 0.0)
+
+                return min((volume_score * 0.6 + acceleration_score * 0.4), 1.0)
+
+            return volume_score
+
+        # Fallback: 30-day velocity
         if past_30d is not None and current > past_30d:
-            if past_30d > 0:
-                weekly_growth = ((current - past_30d) / past_30d) / 4.3
-                daily_absolute = (current - past_30d) / 30
-                weekly_score = min(weekly_growth / target_weekly, 1.5)
-                daily_score = min(daily_absolute / target_daily, 1.5)
-                return min((weekly_score * 0.7 + daily_score * 0.3), 1.0)
-            else:
-                return 1.0
+            return self._volume_score(current, past_30d, 30)
 
         return 0.5
 

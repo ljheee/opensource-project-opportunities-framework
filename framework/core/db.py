@@ -125,6 +125,7 @@ class Database:
             self._migrate_analyses(conn)
             self._create_analyses(conn)
             self._create_opportunities(conn)
+            self._create_prediction_outcomes(conn)
             conn.commit()
         finally:
             conn.close()
@@ -250,6 +251,23 @@ class Database:
             )
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_opp_proj ON opportunities(project_id)')
+
+    def _create_prediction_outcomes(self, conn):
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS prediction_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT REFERENCES projects(id),
+                predicted_at TEXT,
+                stars_at_prediction INTEGER,
+                overall_score_at_prediction REAL,
+                checked_at TEXT,
+                stars_now INTEGER,
+                growth_rate_actual REAL,
+                outcome TEXT
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_pred_proj ON prediction_outcomes(project_id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_pred_outcome ON prediction_outcomes(outcome)')
 
     def _table_exists(self, conn, table_name: str) -> bool:
         """Check if a table exists in the database."""

@@ -64,6 +64,19 @@ class ReportGenerator:
                 "SELECT COUNT(*) FROM opportunities WHERE status = 'open'"
             ).fetchone()[0]
 
+            # Validation metrics
+            total_evaluated = conn.execute(
+                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome != 'pending'"
+            ).fetchone()[0] or 0
+
+            tp_count = conn.execute(
+                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'true_positive'"
+            ).fetchone()[0] or 0
+
+            fp_count = conn.execute(
+                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'false_positive'"
+            ).fetchone()[0] or 0
+
             # Tech stack distribution (latest analysis per project only)
             tech_distribution = conn.execute('''
                 SELECT tech_layer, COUNT(*) as count
@@ -114,11 +127,24 @@ class ReportGenerator:
                 f"- **Projects analyzed today:** {total_analyzed}",
                 f"- **Open opportunities:** {open_opportunities}",
                 "",
+                "## Validation Metrics",
+                "",
+            ]
+
+            if total_evaluated > 0:
+                precision = tp_count / total_evaluated
+                lines.append(f"- **Predictions evaluated:** {total_evaluated}")
+                lines.append(f"- **Precision (7d+ horizon):** {precision:.1%} ({tp_count} TP / {fp_count} FP)")
+            else:
+                lines.append("_No predictions have matured enough for evaluation._")
+
+            lines.extend([
+                "",
                 "---",
                 "",
                 "## Tech Stack Distribution",
                 ""
-            ]
+            ])
 
             if tech_distribution:
                 lines.extend(["| Tech Layer | Count |", "|------------|-------|"])
