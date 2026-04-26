@@ -39,8 +39,9 @@ def record_new_predictions(db: Database):
             ) latest ON e.project_id = latest.project_id
                      AND e.calculated_at = latest.latest_at
             WHERE e.is_early_burst = 1
-              AND e.project_id NOT IN (
-                  SELECT project_id FROM prediction_outcomes
+              AND NOT EXISTS (
+                  SELECT 1 FROM prediction_outcomes po
+                  WHERE po.project_id = e.project_id
               )
         ''')
 

@@ -28,11 +28,11 @@ class ReportGenerator:
             # Get early-burst projects (latest record per project today, then filter is_early_burst)
             projects = conn.execute('''
                 SELECT p.*, e.overall_score, e.star_velocity_score,
-                       e.activity_index_score, e.novelty_score
+                       e.activity_index_score, e.community_buzz_score, e.novelty_score
                 FROM projects p
                 JOIN (
                     SELECT project_id, overall_score, star_velocity_score,
-                           activity_index_score, novelty_score, is_early_burst,
+                           activity_index_score, community_buzz_score, novelty_score, is_early_burst,
                            ROW_NUMBER() OVER (
                                PARTITION BY project_id ORDER BY calculated_at DESC
                            ) as rn
