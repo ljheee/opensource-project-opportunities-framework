@@ -51,6 +51,9 @@ jobs:
       - name: Report
         run: python framework/stages/report.py --date "$(date -u +%Y-%m-%d)"
 
+      - name: Checkpoint WAL
+        run: sqlite3 data/framework.db "PRAGMA wal_checkpoint(TRUNCATE);" || true
+
       - name: Commit & Push
         run: |
           git config user.name "github-actions[bot]"

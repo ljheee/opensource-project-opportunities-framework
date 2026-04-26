@@ -18,8 +18,8 @@ class ScoringEngine:
     def calculate_star_velocity(self, current: int, past_7d: Optional[int],
                                 past_30d: Optional[int]) -> float:
         threshold = self._thresholds('star_velocity')
-        target_weekly = threshold.get('weekly_growth_rate', 0.15)
-        target_daily = threshold.get('daily_absolute', 10)
+        target_weekly = max(threshold.get('weekly_growth_rate', 0.15), 0.0001)
+        target_daily = max(threshold.get('daily_absolute', 10), 0.0001)
 
         # Primary: 7-day velocity
         if past_7d is not None and past_7d > 0 and current > past_7d:

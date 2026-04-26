@@ -332,7 +332,7 @@ class DiscoverStage:
         """Discover from GitHub topics."""
         results = []
         topics = self.config.get_github_topics()
-        languages = self.config.load()['sources']['github']['languages']
+        languages = self.config.load().get('sources', {}).get('github', {}).get('languages', [])
 
         print(f"Discovering from {len(topics)} topics x {len(languages)} languages...")
 
