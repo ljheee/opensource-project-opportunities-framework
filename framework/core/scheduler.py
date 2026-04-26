@@ -25,6 +25,8 @@ class Scheduler:
         return conn
 
     def generate_bulk_tasks(self, date: str, batch_size: int) -> int:
+        if batch_size <= 0:
+            return 0
         conn = self.get_conn()
         try:
             cur = conn.execute('''
@@ -68,6 +70,8 @@ class Scheduler:
             conn.close()
 
     def generate_incremental_tasks(self, date: str, max_tasks: int) -> int:
+        if max_tasks <= 0:
+            return 0
         conn = self.get_conn()
         try:
             cur = conn.execute('''

@@ -43,9 +43,13 @@ class ReportGenerator:
                 (date,)
             ).fetchone()[0]
 
-            total_early_burst = conn.execute(
-                "SELECT COUNT(DISTINCT project_id) FROM early_burst_signals WHERE is_early_burst = 1"
-            ).fetchone()[0]
+            total_early_burst = conn.execute("""
+                SELECT COUNT(DISTINCT project_id) FROM (
+                    SELECT project_id, is_early_burst,
+                           ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY calculated_at DESC) as rn
+                    FROM early_burst_signals
+                ) WHERE rn = 1 AND is_early_burst = 1
+            """).fetchone()[0]
 
             total_analyzed = conn.execute(
                 "SELECT COUNT(DISTINCT project_id) FROM analyses WHERE substr(analyzed_at, 1, 10) = ?",
@@ -200,10 +204,16 @@ class ReportGenerator:
             conn.close()
 
 
+import re
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--date', required=True)
     args = parser.parse_args()
+
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', args.date):
+        print("ERROR: date must be in YYYY-MM-DD format")
+        sys.exit(1)
 
     db = Database()
     generator = ReportGenerator(db)

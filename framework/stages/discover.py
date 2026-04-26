@@ -222,6 +222,7 @@ class DiscoverStage:
                     source = excluded.source,
                     filter_reason = excluded.filter_reason,
                     last_fetched_at = excluded.last_fetched_at,
+                    first_seen_at = COALESCE(projects.first_seen_at, excluded.first_seen_at),
                     status = CASE
                         WHEN projects.status IN ('active', 'scheduled', 'analyzing')
                             THEN projects.status
@@ -244,7 +245,7 @@ class DiscoverStage:
                 source,
                 reset_status,
                 reset_filter_reason,
-                now if not existing else None,
+                now,
                 now
             ))
 

@@ -119,14 +119,14 @@ def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Di
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             project_id, now,
-            analysis.get('tech_layer', ''),
-            analysis.get('application', ''),
-            analysis.get('problem_solved', ''),
-            analysis.get('innovation_summary', ''),
-            analysis.get('differentiation', ''),
-            analysis.get('market_timing', ''),
-            analysis.get('ecosystem_position', ''),
-            analysis.get('commercialization_path', ''),
+            analysis.get('tech_layer') or '',
+            analysis.get('application') or '',
+            analysis.get('problem_solved') or '',
+            analysis.get('innovation_summary') or '',
+            analysis.get('differentiation') or '',
+            analysis.get('market_timing') or '',
+            analysis.get('ecosystem_position') or '',
+            analysis.get('commercialization_path') or '',
             analysis.get('overall_score', 5),
             'v1.0'
         ))
@@ -306,13 +306,17 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
         print(f"  Prompt file not found: {prompt_path}")
         return None
 
+    topics = project.get('topics')
+    if isinstance(topics, list):
+        topics = json.dumps(topics)
+
     prompt = _format_prompt(prompt_template, {
         'name': project.get('name') or 'Unknown',
         'url': project.get('url') or 'N/A',
         'description': project.get('description') or 'N/A',
         'language': project.get('language') or 'N/A',
         'stars': project.get('stars') or 0,
-        'topics': project.get('topics') or '[]',
+        'topics': topics or '[]',
         'overall_score': (project.get('burst_signals') or {}).get('overall_score') or 'N/A',
         'star_velocity': (project.get('burst_signals') or {}).get('star_velocity_score') or 'N/A',
         'activity_index': (project.get('burst_signals') or {}).get('activity_index_score') or 'N/A',

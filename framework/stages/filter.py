@@ -29,7 +29,7 @@ def get_discovered_projects(db: Database, limit: int = 50) -> list:
     conn = db.get_conn()
     try:
         cursor = conn.execute(
-            "SELECT * FROM projects WHERE status='discovered' LIMIT ?",
+            "SELECT * FROM projects WHERE status='discovered' ORDER BY first_seen_at ASC, id ASC LIMIT ?",
             (limit,)
         )
         return [dict(row) for row in cursor.fetchall()]
@@ -52,7 +52,7 @@ def update_project_status(db: Database, project_id: str, status: str,
         else:
             conn.execute("""
                 UPDATE projects
-                SET status='filtered_skip', filter_reason=?
+                SET status='filtered_skip', tech_layer=NULL, application=NULL, filter_reason=?
                 WHERE id=?
             """, (filter_reason, project_id))
         conn.commit()
@@ -163,8 +163,13 @@ def run_filter(db: Database, dry_run: bool = False):
                 skipped += 1
 
             processed += 1
-        except (sqlite3.Error, ValueError, TypeError) as e:
+        except (sqlite3.Error, ValueError, TypeError, KeyError) as e:
             print(f"  Error processing {proj['id']}: {e}")
+            try:
+                update_project_status(db, proj['id'], 'filtered_skip',
+                                      filter_reason=f'filter_error:{e}')
+            except Exception as mark_err:
+                print(f"  Warning: Could not mark {proj['id']} as failed: {mark_err}")
 
     print(f"\nProcessed {processed} projects: {kept} kept, {skipped} skipped")
     return processed
