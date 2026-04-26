@@ -56,8 +56,13 @@ jobs:
         run: python framework/stages/validate.py
 
       - name: Auto-tune Weights
-        if: github.event_name == 'schedule' && github.event.schedule == '0 1 * * *' && $(date -u +%d) == '01'
-        run: python framework/stages/reweight.py --dry-run
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date -u +%d)" = "01" ]; then
+            python framework/stages/reweight.py --dry-run
+          else
+            echo "Skipping weight audit (not 1st of month)"
+          fi
 
       - name: Checkpoint WAL
         run: |

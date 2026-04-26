@@ -43,7 +43,7 @@ class ReportGenerator:
 
             # Get summary stats
             total_projects = conn.execute(
-                "SELECT COUNT(*) FROM projects WHERE COALESCE(substr(first_seen_at, 1, 10), '') <= ? OR first_seen_at IS NULL",
+                "SELECT COUNT(*) FROM projects WHERE (first_seen_at IS NOT NULL AND substr(first_seen_at, 1, 10) <= ?) OR first_seen_at IS NULL",
                 (date,)
             ).fetchone()[0]
 

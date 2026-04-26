@@ -108,7 +108,9 @@ def _detect_inflection(star_history: List[Dict]) -> Optional[Dict]:
         # Prior was flat/declining, any positive recent is acceleration
         phase = 'accelerating' if slope_recent > 0 else 'decline'
     else:
-        ratio = slope_recent / slope_prior
+        # Guard against near-zero slope_prior causing extreme ratios
+        safe_slope_prior = max(slope_prior, 0.01)
+        ratio = slope_recent / safe_slope_prior
         if ratio >= 1.5:
             phase = 'accelerating'
         elif ratio >= 0.8:
@@ -151,17 +153,14 @@ def get_project_data(db: Database, project_id: str, conn=None) -> Optional[Dict]
         if signals:
             proj_dict['burst_signals'] = dict(signals)
 
-        # Get star history for trajectory analysis (shared conn if available)
-        if conn:
-            cursor = conn.execute('''
-                SELECT sampled_at, stars FROM star_history
-                WHERE project_id = ?
-                AND sampled_at >= date('now', '-30 days')
-                ORDER BY sampled_at ASC
-            ''', (project_id,))
-            proj_dict['star_history'] = [dict(row) for row in cursor.fetchall()]
-        else:
-            proj_dict['star_history'] = db.get_project_star_history(project_id, days=30)
+        # Get star history for trajectory analysis
+        cursor = conn.execute('''
+            SELECT sampled_at, stars FROM star_history
+            WHERE project_id = ?
+            AND sampled_at >= date('now', '-30 days')
+            ORDER BY sampled_at ASC
+        ''', (project_id,))
+        proj_dict['star_history'] = [dict(row) for row in cursor.fetchall()]
 
         # Get peer projects for competitive context
         proj_dict['peers'] = db.get_peer_projects(

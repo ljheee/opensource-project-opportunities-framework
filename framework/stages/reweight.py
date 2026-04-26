@@ -246,53 +246,21 @@ def load_current_weights(config_path):
 def apply_config_changes(config_path, new_weights, new_min_score):
     """Update config.yaml with new weights and min_score.
 
-    Uses a line-by-line state machine to preserve comments, ordering,
-    and formatting as much as possible.
+    Loads the config as a YAML dict, modifies values, and writes back.
+    This is more robust than string/regex replacement against formatting
+    changes, comments, or nested keys.
     """
     with open(config_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+        cfg = yaml.safe_load(f)
 
-    in_early_burst = False
-    in_metrics = False
-    current_component = None
-
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-
-        # Track nesting
-        if stripped.startswith('early_burst:'):
-            in_early_burst = True
-            in_metrics = False
-            current_component = None
-            continue
-
-        if in_early_burst and stripped == 'metrics:':
-            in_metrics = True
-            continue
-
-        # Detect component sections under metrics
-        if in_metrics and not stripped.startswith('-') and stripped.endswith(':'):
-            comp_key = stripped.rstrip(':')
-            if comp_key in COMPONENTS:
-                current_component = comp_key
-            else:
-                current_component = None
-            continue
-
-        # Update min_score
-        if in_early_burst and not in_metrics and stripped.startswith('min_score:'):
-            prefix = line[:line.index('min_score:') + len('min_score:')]
-            lines[i] = f"{prefix} {new_min_score}\n"
-            continue
-
-        # Update weight lines
-        if current_component and stripped.startswith('weight:'):
-            prefix = line[:line.index('weight:') + len('weight:')]
-            lines[i] = f"{prefix} {new_weights[current_component]:.4f}\n"
-            continue
+    eb = cfg.setdefault('early_burst', {})
+    eb['min_score'] = new_min_score
+    metrics = eb.setdefault('metrics', {})
+    for comp, weight in new_weights.items():
+        metrics.setdefault(comp, {})['weight'] = weight
 
     with open(config_path, 'w', encoding='utf-8') as f:
-        f.writelines(lines)
+        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
 
 def print_proposal(rows, current_weights, current_min_score,
