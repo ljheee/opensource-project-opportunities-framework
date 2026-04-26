@@ -86,6 +86,64 @@ filters:
     - "awesome"
     - "tutorial"
     - "demo"
+    - "examples"
+    - "course"
+    - "curated-list"
+  category_keywords:
+    ai:
+      - "llm"
+      - "ai"
+      - "machine-learning"
+      - "deep-learning"
+      - "neural"
+      - "transformer"
+      - "gpt"
+      - "bert"
+      - "llama"
+      - "model"
+      - "inference"
+      - "training"
+      - "fine-tuning"
+      - "embedding"
+      - "vector"
+      - "agent"
+      - "generative"
+      - "diffusion"
+      - "stable-diffusion"
+      - "openai"
+      - "langchain"
+      - "huggingface"
+      - "pytorch"
+      - "tensorflow"
+  tech_layer_rules:
+    foundation_model:
+      - "foundation"
+      - "llm"
+      - "model"
+      - "gpt"
+      - "bert"
+    inference_engine:
+      - "inference"
+      - "serving"
+      - "deployment"
+    training_framework:
+      - "training"
+      - "fine-tune"
+      - "distributed"
+    ai_toolchain:
+      - "tool"
+      - "sdk"
+      - "library"
+      - "framework"
+
+anchors:
+  - "rag"
+  - "agent"
+  - "diffusion"
+  - "langchain"
+  - "ollama"
+  - "code-generation"
+  - "voice-ai"
 
 scheduling:
   bulk:

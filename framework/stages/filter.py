@@ -11,6 +11,16 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from framework.core.db import Database
+from framework.core.config_loader import ConfigLoader
+
+_FILTER_CFG = None
+
+
+def _get_filter_cfg() -> dict:
+    global _FILTER_CFG
+    if _FILTER_CFG is None:
+        _FILTER_CFG = ConfigLoader().get_filters()
+    return _FILTER_CFG
 
 
 def get_discovered_projects(db: Database, limit: int = 50) -> list:
@@ -57,48 +67,46 @@ def classify_project_heuristic(project: dict) -> tuple:
     Heuristic classification based on project metadata.
     Returns: (should_keep, tech_layer, application, reason)
     """
-    name = project.get('name', '').lower()
+    name = (project.get('name') or '').lower()
     desc = (project.get('description') or '').lower()
     topics = project.get('topics', '[]') or '[]'
     if isinstance(topics, str):
         try:
             topics = json.loads(topics)
-        except:
+        except Exception:
             topics = []
     if not topics:
         topics = []
     topics_str = ' '.join(topics).lower()
 
-    # Skip patterns
-    skip_patterns = ['awesome', 'tutorial', 'demo', 'examples', 'course',
-                     'curated-list', 'awesome-list', 'playground']
+    cfg = _get_filter_cfg()
+
+    # Skip patterns from config
+    skip_patterns = cfg.get('skip_patterns', [])
     for pattern in skip_patterns:
-        if pattern in name or pattern in desc:
+        if pattern and (pattern in name or pattern in desc):
             return False, None, None, f'skip_pattern:{pattern}'
 
     # Check for AI focus via topics and description
-    ai_keywords = ['llm', 'ai', 'machine-learning', 'deep-learning', 'neural',
-                   'transformer', 'gpt', 'bert', 'llama', 'model', 'inference',
-                   'training', 'fine-tuning', 'embedding', 'vector', 'agent',
-                   'generative', 'diffusion', 'stable-diffusion', 'openai',
-                   'langchain', 'huggingface', 'pytorch', 'tensorflow']
-
-    has_ai_focus = any(kw in topics_str or kw in desc for kw in ai_keywords)
+    ai_keywords = cfg.get('category_keywords', {}).get('ai', [])
+    has_ai_focus = any(kw and (kw in topics_str or kw in desc) for kw in ai_keywords)
 
     if not has_ai_focus:
         return False, None, None, 'no_ai_focus'
 
-    # Tech layer classification
+    # Tech layer classification from config rules
+    tech_layer_rules = cfg.get('tech_layer_rules', {})
     tech_layer = 'ai_application'  # default
-    if any(kw in topics_str or kw in desc for kw in ['foundation', 'llm', 'model', 'gpt', 'bert']):
-        if 'inference' in desc or 'serving' in desc or 'deployment' in desc:
-            tech_layer = 'inference_engine'
-        else:
-            tech_layer = 'foundation_model'
-    elif any(kw in topics_str or kw in desc for kw in ['training', 'fine-tune', 'distributed']):
-        tech_layer = 'training_framework'
-    elif any(kw in topics_str or kw in desc for kw in ['tool', 'sdk', 'library', 'framework']):
-        tech_layer = 'ai_toolchain'
+    for layer, keywords in tech_layer_rules.items():
+        if any(kw and (kw in topics_str or kw in desc) for kw in keywords):
+            if layer == 'foundation_model':
+                if any(kw in topics_str or kw in desc for kw in ['inference', 'serving', 'deployment']):
+                    tech_layer = 'inference_engine'
+                else:
+                    tech_layer = 'foundation_model'
+            else:
+                tech_layer = layer
+            break
 
     # Application classification
     application = 'multimodal'  # default

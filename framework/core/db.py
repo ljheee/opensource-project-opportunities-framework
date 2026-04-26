@@ -10,12 +10,103 @@ class Database:
             base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
             db_path = os.path.join(base_dir, 'data', 'framework.db')
         self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
 
     def get_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def _add_column_if_missing(self, conn, table, column, col_def):
+        """Add a column if it doesn't already exist."""
+        cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+            print(f"DB migration: added {table}.{column}")
+
+    def _migrate_projects(self, conn):
+        """Migrate projects table: add missing columns."""
+        self._add_column_if_missing(conn, 'projects', 'description', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'prev_stars', 'INTEGER')
+        self._add_column_if_missing(conn, 'projects', 'prev_open_issues', 'INTEGER')
+
+    def _migrate_analyses(self, conn):
+        """Migrate analyses table: add missing columns and CHECK constraint via table rebuild."""
+        # Crash recovery first: handle interrupted migration from previous run
+        analyses_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='analyses'"
+        ).fetchone() is not None
+        new_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='analyses_new'"
+        ).fetchone() is not None
+
+        if not analyses_exists and new_exists:
+            conn.execute("ALTER TABLE analyses_new RENAME TO analyses")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ana_proj ON analyses(project_id)")
+            print("DB migration: recovered interrupted migration (analyses_new -> analyses)")
+            return
+
+        if analyses_exists and new_exists:
+            conn.execute("DROP TABLE analyses_new")
+
+        if not analyses_exists:
+            # Table will be created by _create_analyses; nothing to migrate
+            return
+
+        # Add missing columns via ALTER TABLE (for existing schema before rebuild)
+        self._add_column_if_missing(conn, 'analyses', 'overall_score', 'INTEGER')
+        self._add_column_if_missing(conn, 'analyses', 'ecosystem_position', 'TEXT')
+        self._add_column_if_missing(conn, 'analyses', 'commercialization_path', 'TEXT')
+
+        has_check = False
+        cursor = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='analyses'"
+        ).fetchone()
+        if cursor and cursor['sql']:
+            has_check = 'CHECK(overall_score BETWEEN 1 AND 10)' in cursor['sql']
+
+        if has_check:
+            return
+
+        conn.execute("DROP TABLE IF EXISTS analyses_new")
+        conn.execute("""
+            CREATE TABLE analyses_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT,
+                analyzed_at TEXT,
+                tech_layer TEXT,
+                application TEXT,
+                problem_solved TEXT,
+                innovation_summary TEXT,
+                differentiation TEXT,
+                market_timing TEXT,
+                ecosystem_position TEXT,
+                commercialization_path TEXT,
+                overall_score INTEGER CHECK(overall_score BETWEEN 1 AND 10),
+                analyzer_version TEXT
+            )
+        """)
+        conn.execute("""
+            INSERT INTO analyses_new
+                SELECT id, project_id, analyzed_at, tech_layer, application,
+                       problem_solved, innovation_summary, differentiation,
+                       market_timing, ecosystem_position, commercialization_path,
+                       CASE WHEN CAST(COALESCE(overall_score, 5) AS INTEGER) < 1 THEN 1
+                            WHEN CAST(COALESCE(overall_score, 5) AS INTEGER) > 10 THEN 10
+                            ELSE CAST(COALESCE(overall_score, 5) AS INTEGER) END,
+                       analyzer_version
+            FROM analyses
+        """)
+        conn.execute("DROP TABLE analyses")
+        conn.execute("ALTER TABLE analyses_new RENAME TO analyses")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ana_proj ON analyses(project_id)")
+        print("DB migration: analyses table rebuilt with CHECK(overall_score BETWEEN 1 AND 10)")
 
     def init_tables(self):
         conn = self.get_conn()
@@ -24,6 +115,8 @@ class Database:
             self._create_star_history(conn)
             self._create_early_burst_signals(conn)
             self._create_tasks(conn)
+            self._migrate_projects(conn)
+            self._migrate_analyses(conn)
             self._create_analyses(conn)
             self._create_opportunities(conn)
             conn.commit()
@@ -44,6 +137,7 @@ class Database:
                 first_commit_at TEXT,
                 last_commit_at TEXT,
                 topics TEXT,
+                description TEXT,
                 tech_layer TEXT,
                 application TEXT,
                 category TEXT,
@@ -52,7 +146,9 @@ class Database:
                 filter_reason TEXT,
                 first_seen_at TEXT,
                 last_fetched_at TEXT,
-                contributor_count INTEGER
+                contributor_count INTEGER,
+                prev_stars INTEGER,
+                prev_open_issues INTEGER
             )
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_p_status ON projects(status)')
@@ -119,7 +215,9 @@ class Database:
                 innovation_summary TEXT,
                 differentiation TEXT,
                 market_timing TEXT,
-                overall_score INTEGER,
+                ecosystem_position TEXT,
+                commercialization_path TEXT,
+                overall_score INTEGER CHECK(overall_score BETWEEN 1 AND 10),
                 analyzer_version TEXT
             )
         ''')
@@ -146,6 +244,87 @@ class Database:
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_opp_proj ON opportunities(project_id)')
 
+    def _table_exists(self, conn, table_name: str) -> bool:
+        """Check if a table exists in the database."""
+        result = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,)
+        ).fetchone()
+        return result is not None
+
+    def repair_analyzing_status(self):
+        """Reset projects and tasks stuck after crash."""
+        conn = self.get_conn()
+        try:
+            if not self._table_exists(conn, 'tasks'):
+                return
+            # Reset tasks stuck in 'running' back to 'pending' and bump date to today
+            conn.execute("""
+                UPDATE tasks SET status='pending', started_at=NULL, task_date=date('now')
+                WHERE status='running'
+            """)
+            # Bump old pending tasks to today so they remain schedulable
+            conn.execute("""
+                UPDATE tasks SET task_date=date('now')
+                WHERE status='pending' AND task_date < date('now')
+            """)
+            if not self._table_exists(conn, 'projects'):
+                conn.commit()
+                return
+            # Priority 1: projects with completed tasks and no pending/running → reset to active
+            conn.execute("""
+                UPDATE projects SET status='active'
+                WHERE status='analyzing'
+                  AND id IN (SELECT DISTINCT project_id FROM tasks WHERE status='done')
+                  AND id NOT IN (
+                      SELECT DISTINCT project_id FROM tasks
+                      WHERE task_type IN ('bulk','incremental','triggered')
+                        AND status IN ('pending','running')
+                  )
+            """)
+            # Priority 2: projects with pending/running tasks (bulk/incremental/triggered)
+            # → reset to scheduled so they can be rescheduled/re-picked
+            conn.execute("""
+                UPDATE projects SET status='scheduled'
+                WHERE status='analyzing'
+                  AND id IN (
+                      SELECT DISTINCT project_id FROM tasks
+                      WHERE task_type IN ('bulk','incremental','triggered')
+                        AND status IN ('pending','running')
+                  )
+            """)
+            # Priority 3: remaining → reset to discovered
+            conn.execute("""
+                UPDATE projects SET status='discovered'
+                WHERE status='analyzing'
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def repair_orphan_records(self):
+        """Fix tasks referencing non-existent projects."""
+        conn = self.get_conn()
+        try:
+            if self._table_exists(conn, 'tasks') and self._table_exists(conn, 'projects'):
+                conn.execute("""
+                    DELETE FROM tasks
+                    WHERE project_id NOT IN (SELECT id FROM projects)
+                """)
+            if self._table_exists(conn, 'analyses') and self._table_exists(conn, 'projects'):
+                conn.execute("""
+                    DELETE FROM analyses
+                    WHERE project_id NOT IN (SELECT id FROM projects)
+                """)
+            if self._table_exists(conn, 'opportunities') and self._table_exists(conn, 'projects'):
+                conn.execute("""
+                    DELETE FROM opportunities
+                    WHERE project_id NOT IN (SELECT id FROM projects)
+                """)
+            conn.commit()
+        finally:
+            conn.close()
+
     def sample_star_count(self, project_id: str, stars: int):
         conn = self.get_conn()
         try:
@@ -164,7 +343,7 @@ class Database:
             cursor = conn.execute('''
                 SELECT * FROM star_history
                 WHERE project_id = ?
-                AND sampled_at >= datetime('now', '-' || ? || ' days')
+                AND sampled_at >= date('now', '-' || ? || ' days')
                 ORDER BY sampled_at DESC
             ''', (project_id, days))
             return [dict(row) for row in cursor.fetchall()]

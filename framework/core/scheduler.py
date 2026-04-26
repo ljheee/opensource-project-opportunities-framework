@@ -18,6 +18,10 @@ class Scheduler:
     def get_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def generate_bulk_tasks(self, date: str, batch_size: int) -> int:
@@ -26,9 +30,24 @@ class Scheduler:
             cur = conn.execute('''
                 SELECT p.id, COALESCE(e.overall_score, 0.5) as burst_score
                 FROM projects p
-                LEFT JOIN early_burst_signals e ON p.id = e.project_id
-                WHERE p.status = 'discovered'
-                AND p.id NOT IN (SELECT project_id FROM tasks WHERE task_type = 'bulk')
+                LEFT JOIN (
+                    SELECT project_id, overall_score,
+                           ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY calculated_at DESC) as rn
+                    FROM early_burst_signals
+                ) e ON p.id = e.project_id AND e.rn = 1
+                WHERE p.status = 'scheduled'
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks t
+                    WHERE t.project_id = p.id
+                    AND t.task_type = 'bulk'
+                    AND t.status = 'done'
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks t
+                    WHERE t.project_id = p.id
+                    AND t.task_type = 'bulk'
+                    AND t.status IN ('pending', 'running')
+                )
                 ORDER BY burst_score DESC, p.stars DESC
                 LIMIT ?
             ''', (batch_size,))
@@ -54,9 +73,22 @@ class Scheduler:
             cur = conn.execute('''
                 SELECT p.id, COALESCE(e.overall_score, 0.5) as burst_score
                 FROM projects p
-                LEFT JOIN early_burst_signals e ON p.id = e.project_id
-                WHERE p.status = 'scheduled'
-                AND p.id NOT IN (SELECT project_id FROM tasks WHERE task_date = ?)
+                LEFT JOIN (
+                    SELECT project_id, overall_score,
+                           ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY calculated_at DESC) as rn
+                    FROM early_burst_signals
+                ) e ON p.id = e.project_id AND e.rn = 1
+                WHERE p.status IN ('scheduled', 'active')
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks t
+                    WHERE t.project_id = p.id
+                    AND t.task_date = ?
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks t
+                    WHERE t.project_id = p.id
+                    AND t.status IN ('pending', 'running')
+                )
                 ORDER BY burst_score DESC
                 LIMIT ?
             ''', (date, max_tasks))
@@ -73,26 +105,6 @@ class Scheduler:
 
             conn.commit()
             return count
-        finally:
-            conn.close()
-
-    def get_pending_tasks(self, date: str, task_type: Optional[str] = None) -> List[Dict]:
-        """Get pending tasks for a date."""
-        conn = self.get_conn()
-        try:
-            if task_type:
-                cur = conn.execute("""
-                    SELECT * FROM tasks
-                    WHERE task_date = ? AND status = 'pending' AND task_type = ?
-                    ORDER BY priority_score DESC
-                """, (date, task_type))
-            else:
-                cur = conn.execute("""
-                    SELECT * FROM tasks
-                    WHERE task_date = ? AND status = 'pending'
-                    ORDER BY priority_score DESC
-                """, (date,))
-            return [dict(row) for row in cur.fetchall()]
         finally:
             conn.close()
 

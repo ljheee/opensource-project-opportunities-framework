@@ -33,6 +33,9 @@ jobs:
       - name: Init DB
         run: python framework/stages/init_db.py
 
+      - name: Crash Recovery
+        run: python -c "from framework.core.db import Database; db = Database(); db.repair_analyzing_status(); db.repair_orphan_records()"
+
       - name: Discover
         run: python framework/stages/discover.py
 

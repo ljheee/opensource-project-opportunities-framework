@@ -8,6 +8,7 @@ import sys
 import json
 import time
 import argparse
+import re
 import requests
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Set
@@ -67,6 +68,8 @@ class DiscoverStage:
 
         max_retries = self.resilience.get('github_api', {}).get('max_retries', 3)
         retry_delay = self.resilience.get('github_api', {}).get('retry_delay_seconds', 60)
+        if max_retries < 1:
+            max_retries = 1
 
         for attempt in range(max_retries):
             try:
@@ -84,16 +87,23 @@ class DiscoverStage:
                     wait_time = max(reset_time - int(time.time()), 60)
                     print(f"  Rate limited. Waiting {wait_time}s...")
                     time.sleep(min(wait_time, 3600))
+                    if attempt >= max_retries - 1:
+                        raise GitHubAPIError(f"Rate limited after {attempt + 1} attempts")
                     continue
 
                 if response.status_code == 429:
                     retry_after = int(response.headers.get('Retry-After', 60))
                     print(f"  Too many requests. Waiting {retry_after}s...")
                     time.sleep(min(retry_after, retry_delay))
+                    if attempt >= max_retries - 1:
+                        raise GitHubAPIError(f"Too many requests after {attempt + 1} attempts")
                     continue
 
                 response.raise_for_status()
-                return response.json()
+                try:
+                    return response.json()
+                except ValueError as e:
+                    raise GitHubAPIError(f"Invalid JSON response: {e}")
 
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
@@ -103,13 +113,13 @@ class DiscoverStage:
                 else:
                     raise GitHubAPIError(f"Failed after {attempt + 1} attempts: {e}")
 
-        return {}
+        raise GitHubAPIError("Unexpected end of retry loop")
 
     def _should_skip_repo(self, repo: Dict) -> tuple[bool, str]:
         """Check if repository should be skipped based on filters."""
         filters = self.config.get_filters()
 
-        stars = repo.get('stargazers_count', 0)
+        stars = repo.get('stargazers_count') or 0
         if stars < self.star_min:
             return True, f"stars_too_few:{stars}"
         if stars > self.star_max:
@@ -119,77 +129,126 @@ class DiscoverStage:
             return True, "archived"
 
         # Check stale (no commits in 180 days)
-        pushed = repo.get('pushed_at', '')
+        pushed = repo.get('pushed_at') or ''
         if pushed:
             try:
                 pushed_dt = datetime.fromisoformat(pushed.replace('Z', '+00:00'))
+                if pushed_dt.tzinfo is None:
+                    pushed_dt = pushed_dt.replace(tzinfo=timezone.utc)
                 stale_cutoff = datetime.now(timezone.utc) - timedelta(days=180)
                 if pushed_dt < stale_cutoff:
                     return True, f"stale_since:{pushed[:10]}"
-            except:
+            except Exception:
                 pass
 
         # Check skip patterns
-        name = repo.get('name', '').lower()
+        name = (repo.get('name') or '').lower()
         desc = (repo.get('description') or '').lower()
-        for pattern in filters['skip_patterns']:
-            if pattern in name or pattern in desc:
+        for pattern in filters.get('skip_patterns', []):
+            if pattern and (pattern in name or pattern in desc):
                 return True, f"skip_pattern:{pattern}"
 
         if repo.get('fork'):
             return True, "is_fork"
 
+        # Check required filters from config
+        required = filters.get('required', {})
+        if required.get('has_code') and repo.get('size', 0) == 0:
+            return True, "empty_repo"
+
         return False, ""
 
-    def _upsert_project(self, repo: Dict, source: str, signal: str):
-        """Insert or update project in database."""
-        conn = self.db.get_conn()
+    def _upsert_project(self, repo: Dict, source: str, signal: str,
+                        conn=None, _upsert_counter: list = None):
+        """Insert or update project in database.
+
+        When called with a shared connection and counter, accumulates
+        and commits every 100 upserts.
+        """
+        should_close = conn is None
+        conn = conn or self.db.get_conn()
         try:
             now = datetime.now(timezone.utc).isoformat()
-            project_id = repo['full_name']
+            project_id = repo.get('full_name')
+            if not project_id:
+                raise ValueError("Repository missing full_name")
 
-            # Check if project exists
+            # Check if project exists and get current metadata for change detection
             existing = conn.execute(
-                'SELECT 1 FROM projects WHERE id = ?', (project_id,)
+                'SELECT topics, description, status FROM projects WHERE id = ?', (project_id,)
             ).fetchone()
+
+            new_topics = json.dumps(repo.get('topics') or [])
+            new_desc = (repo.get('description') or '')[:500]
+
+            if existing:
+                old_topics = existing['topics'] or '[]'
+                old_desc = existing['description'] or ''
+                old_status = existing['status']
+                if old_status in ('active', 'scheduled', 'analyzing'):
+                    reset_status = old_status
+                elif old_status == 'filtered_skip':
+                    metadata_changed = old_topics != new_topics or old_desc != new_desc
+                    reset_status = 'discovered' if metadata_changed else 'filtered_skip'
+                else:
+                    reset_status = 'discovered'
+            else:
+                reset_status = 'discovered'
 
             # Insert or update project
             conn.execute('''
                 INSERT INTO projects (
                     id, name, url, language, stars, open_issues, forks,
-                    created_at, last_commit_at, topics, description,
+                    created_at, first_commit_at, last_commit_at, topics, description,
                     category, source, status, first_seen_at, last_fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    url = excluded.url,
+                    language = excluded.language,
                     stars = excluded.stars,
                     open_issues = excluded.open_issues,
                     forks = excluded.forks,
                     last_commit_at = excluded.last_commit_at,
                     topics = excluded.topics,
                     description = excluded.description,
-                    last_fetched_at = excluded.last_fetched_at
+                    source = excluded.source,
+                    last_fetched_at = excluded.last_fetched_at,
+                    status = CASE
+                        WHEN projects.status IN ('active', 'scheduled', 'analyzing')
+                            THEN projects.status
+                        ELSE excluded.status
+                    END
             ''', (
                 project_id,
                 repo.get('name'),
                 repo.get('html_url'),
                 repo.get('language'),
-                repo.get('stargazers_count', 0),
-                repo.get('open_issues_count', 0),
-                repo.get('forks_count', 0),
+                repo.get('stargazers_count') or 0,
+                repo.get('open_issues_count') or 0,
+                repo.get('forks_count') or 0,
+                repo.get('created_at'),
                 repo.get('created_at'),
                 repo.get('pushed_at'),
-                json.dumps(repo.get('topics', [])),
-                repo.get('description', '')[:500],
+                new_topics,
+                new_desc,
                 'ai',
                 source,
+                reset_status,
                 now if not existing else None,
                 now
             ))
 
-            conn.commit()
+            if _upsert_counter is not None:
+                _upsert_counter[0] += 1
+                if _upsert_counter[0] % 100 == 0:
+                    conn.commit()
+            else:
+                conn.commit()
             return project_id
         finally:
-            conn.close()
+            if should_close:
+                conn.close()
 
     def _sample_star_count(self, project_id: str, stars: int):
         """Sample current star count for velocity tracking."""
@@ -208,7 +267,7 @@ class DiscoverStage:
                 return
 
             # Get star history
-            current_stars = proj['stars']
+            current_stars = proj['stars'] or 0
             history = self.db.get_project_star_history(project_id, days=35)
 
             # Find stars from 7d and 30d ago
@@ -217,8 +276,8 @@ class DiscoverStage:
 
             now = datetime.now(timezone.utc)
             for sample in history:
-                sample_date = datetime.fromisoformat(sample['sampled_at'].replace('Z', '+00:00'))
-                days_ago = (now - sample_date).days
+                sample_date = datetime.fromisoformat(sample['sampled_at']).date()
+                days_ago = (now.date() - sample_date).days
 
                 if 6 <= days_ago <= 8 and stars_7d_ago is None:
                     stars_7d_ago = sample['stars']
@@ -233,7 +292,7 @@ class DiscoverStage:
                 proj['open_issues'] or 0, 3
             )
             novelty_score = self.scoring.calculate_novelty(
-                proj['created_at'], 1
+                proj['first_commit_at'] or proj['created_at'], 1
             )
             buzz_score = 0.3
 
@@ -285,7 +344,11 @@ class DiscoverStage:
                 try:
                     data = self._github_request(url, {"q": query, "sort": "stars", "per_page": 30}, is_search=True)
 
-                    for repo in data.get('items', []):
+                    if not isinstance(data, dict):
+                        print(f"  Unexpected search response type: {type(data)}")
+                        continue
+
+                    for repo in (data.get('items') or []):
                         skip, reason = self._should_skip_repo(repo)
                         if not skip:
                             results.append({
@@ -294,7 +357,7 @@ class DiscoverStage:
                                 'signal': f"{topic}/{lang}"
                             })
                         else:
-                            print(f"  Skip ({reason}): {repo['full_name']}")
+                            print(f"  Skip ({reason}): {repo.get('full_name', 'unknown')}")
 
                 except GitHubAPIError as e:
                     print(f"  Error searching {topic}/{lang}: {e}")
@@ -321,8 +384,12 @@ class DiscoverStage:
                     if not repos:
                         break
 
+                    if not isinstance(repos, list):
+                        print(f"  Unexpected response type from {org}: {type(repos)}")
+                        break
+
                     for repo in repos:
-                        stars = repo.get('stargazers_count', 0)
+                        stars = repo.get('stargazers_count') or 0
                         if stars < self.star_min or stars > self.star_max:
                             continue
 
@@ -339,6 +406,72 @@ class DiscoverStage:
                 except GitHubAPIError as e:
                     print(f"  Error fetching {org}: {e}")
                     break
+
+        return results
+
+    def discover_trending(self) -> List[Dict]:
+        """Discover from GitHub Trending pages (HTML parsing)."""
+        cfg = self.config.load()
+        trending_cfg = cfg.get('sources', {}).get('trending', {})
+        languages = trending_cfg.get('languages', [])
+        periods = trending_cfg.get('periods', ['daily', 'weekly'])
+
+        # GitHub non-repo path prefixes to filter out navigation links
+        _NON_REPO_PREFIXES = {
+            "features", "marketplace", "login", "logout", "settings", "explore",
+            "notifications", "issues", "pulls", "sponsors", "about", "pricing",
+            "enterprise", "topics", "collections", "events", "apps", "contact",
+            "security", "organizations", "new", "codespaces", "copilot", "orgs", "users",
+        }
+
+        results = []
+        for lang in languages:
+            for period in periods:
+                url = f"https://github.com/trending/{lang}?since={period}"
+                try:
+                    r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+                    r.raise_for_status()
+                    raw = re.findall(
+                        r'href=[\'"]/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)[\'"]', r.text
+                    )
+                    seen: set[str] = set()
+                    repo_names: list[str] = []
+                    for full_name in raw:
+                        if full_name in seen:
+                            continue
+                        seen.add(full_name)
+                        owner = full_name.split("/")[0]
+                        if owner in _NON_REPO_PREFIXES:
+                            continue
+                        repo_names.append(full_name)
+                        if len(repo_names) >= 25:
+                            break
+
+                    if not repo_names:
+                        print(
+                            f"  WARN: trending {lang}/{period} parsed 0 projects, "
+                            "HTML structure may have changed"
+                        )
+                        continue
+
+                    for full_name in repo_names:
+                        api_url = f"https://api.github.com/repos/{full_name}"
+                        try:
+                            repo = self._github_request(api_url)
+                            if not repo:
+                                continue
+                            skip, reason = self._should_skip_repo(repo)
+                            if not skip:
+                                results.append({
+                                    'repo': repo,
+                                    'source': 'trending',
+                                    'signal': f"{lang}/{period}",
+                                })
+                        except GitHubAPIError:
+                            pass
+                except Exception as e:
+                    print(f"  trending_error {lang}/{period}: {e}")
+                time.sleep(1)
 
         return results
 
@@ -362,12 +495,18 @@ class DiscoverStage:
         all_results.extend(eco_results)
         print(f"  Found: {len(eco_results)} projects")
 
+        # Source 3: Trending
+        print("Source 3: GitHub Trending...")
+        trending_results = self.discover_trending()
+        all_results.extend(trending_results)
+        print(f"  Found: {len(trending_results)} projects")
+
         # Deduplicate
         seen: Set[str] = set()
         unique_results = []
         for item in all_results:
-            pid = item['repo']['full_name']
-            if pid not in seen:
+            pid = (item.get('repo') or {}).get('full_name')
+            if pid and pid not in seen:
                 seen.add(pid)
                 unique_results.append(item)
 
@@ -376,20 +515,31 @@ class DiscoverStage:
         if dry_run:
             print("\nDry run - not writing to database")
             for item in unique_results[:10]:
-                print(f"  {item['repo']['full_name']} ({item['source']})")
+                print(f"  {(item.get('repo') or {}).get('full_name', 'unknown')} ({item['source']})")
             return
 
         # Store results
         print("\nStoring projects...")
         stored_count = 0
-        for item in unique_results:
-            try:
-                project_id = self._upsert_project(item['repo'], item['source'], item['signal'])
-                self._sample_star_count(project_id, item['repo']['stargazers_count'])
-                self._calculate_and_store_burst_score(project_id)
-                stored_count += 1
-            except Exception as e:
-                print(f"  Error storing {item['repo']['full_name']}: {e}")
+        conn = self.db.get_conn()
+        try:
+            upsert_counter = [0]
+            for item in unique_results:
+                try:
+                    project_id = self._upsert_project(
+                        item['repo'], item['source'], item['signal'],
+                        conn=conn, _upsert_counter=upsert_counter
+                    )
+                    conn.commit()  # Ensure project is visible to new connections
+                    self._sample_star_count(project_id, (item.get('repo') or {}).get('stargazers_count') or 0)
+                    self._calculate_and_store_burst_score(project_id)
+                    stored_count += 1
+                except Exception as e:
+                    repo_name = (item.get('repo') or {}).get('full_name', 'unknown')
+                    print(f"  Error storing {repo_name}: {e}")
+            conn.commit()
+        finally:
+            conn.close()
 
         print(f"\nStored {stored_count} projects")
 
@@ -402,7 +552,8 @@ class DiscoverStage:
             ).fetchall()
 
             for proj in active_projects:
-                self._sample_star_count(proj['id'], proj['stars'])
+                self._sample_star_count(proj['id'], proj['stars'] or 0)
+                self._calculate_and_store_burst_score(proj['id'])
 
             print(f"  Sampled {len(active_projects)} existing projects")
         finally:

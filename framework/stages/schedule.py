@@ -16,6 +16,10 @@ def main():
     parser.add_argument('--batch-size', type=int, default=20)
     args = parser.parse_args()
 
+    if args.batch_size <= 0:
+        print("ERROR: batch-size must be a positive integer")
+        sys.exit(1)
+
     config = ConfigLoader()
     db = Database()
     scheduler = Scheduler(db.db_path, config.get_scheduling_config())
@@ -26,7 +30,9 @@ def main():
     if args.mode == 'bulk':
         count = scheduler.generate_bulk_tasks(today, args.batch_size)
     else:
-        max_tasks = config.get_scheduling_config()['incremental']['max_per_day']
+        scheduling_cfg = config.get_scheduling_config()
+        incremental_cfg = scheduling_cfg.get('incremental', {}) if scheduling_cfg else {}
+        max_tasks = incremental_cfg.get('max_per_day', 15)
         count = scheduler.generate_incremental_tasks(today, max_tasks)
 
     print(f"Generated {count} tasks for {today}")

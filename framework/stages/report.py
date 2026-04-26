@@ -8,6 +8,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from framework.core.db import Database
 
 
+def _escape_md(text) -> str:
+    if text is None:
+        return ''
+    return str(text).replace('|', '\\|').replace('\n', ' ')
+
+
 class ReportGenerator:
     def __init__(self, db: Database):
         self.db = db
@@ -15,98 +21,167 @@ class ReportGenerator:
     def generate(self, date: str):
         conn = self.db.get_conn()
         try:
-            # Get early-burst projects
+            # Get early-burst projects (latest record per project today, then filter is_early_burst)
             projects = conn.execute('''
                 SELECT p.*, e.overall_score, e.star_velocity_score,
                        e.activity_index_score, e.novelty_score
                 FROM projects p
-                JOIN early_burst_signals e ON p.id = e.project_id
-                WHERE e.is_early_burst = 1
-                AND date(e.calculated_at) = ?
+                JOIN (
+                    SELECT project_id, overall_score, star_velocity_score,
+                           activity_index_score, novelty_score, is_early_burst,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY project_id ORDER BY calculated_at DESC
+                           ) as rn
+                    FROM early_burst_signals
+                ) e ON p.id = e.project_id AND e.rn = 1 AND e.is_early_burst = 1
                 ORDER BY e.overall_score DESC
-            ''', (date,)).fetchall()
-
-            # Get top opportunities
-            opportunities = conn.execute('''
-                SELECT o.*, p.name as project_name, p.url as project_url
-                FROM opportunities o
-                JOIN projects p ON o.project_id = p.id
-                WHERE o.impact_potential = 'high'
-                AND date(o.source_analysis_date) = ?
-                ORDER BY o.source_analysis_date DESC
-                LIMIT 20
-            ''', (date,)).fetchall()
+            ''').fetchall()
 
             # Get summary stats
             total_projects = conn.execute(
-                "SELECT COUNT(*) FROM projects WHERE date(first_seen_at) <= ?",
+                "SELECT COUNT(*) FROM projects WHERE date(first_seen_at) <= ? OR first_seen_at IS NULL",
                 (date,)
             ).fetchone()[0]
 
+            total_early_burst = conn.execute(
+                "SELECT COUNT(DISTINCT project_id) FROM early_burst_signals WHERE is_early_burst = 1"
+            ).fetchone()[0]
+
             total_analyzed = conn.execute(
-                "SELECT COUNT(*) FROM analyses WHERE date(analyzed_at) = ?",
+                "SELECT COUNT(DISTINCT project_id) FROM analyses WHERE date(analyzed_at) = ?",
                 (date,)
             ).fetchone()[0]
+
+            open_opportunities = conn.execute(
+                "SELECT COUNT(*) FROM opportunities WHERE status = 'open'"
+            ).fetchone()[0]
+
+            # Tech stack distribution (latest analysis per project only)
+            tech_distribution = conn.execute('''
+                SELECT tech_layer, COUNT(*) as count
+                FROM (
+                    SELECT tech_layer,
+                           ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY analyzed_at DESC) as rn
+                    FROM analyses
+                    WHERE tech_layer IS NOT NULL AND tech_layer != ''
+                )
+                WHERE rn = 1
+                GROUP BY tech_layer
+                ORDER BY count DESC
+            ''').fetchall()
+
+            # Top opportunities sorted by impact_potential and overall_score
+            # Use latest analysis per project to avoid Cartesian product
+            top_opportunities = conn.execute('''
+                SELECT o.*, p.name as project_name, p.url as project_url, a.overall_score
+                FROM opportunities o
+                JOIN projects p ON o.project_id = p.id
+                JOIN (
+                    SELECT project_id, overall_score,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY project_id ORDER BY analyzed_at DESC
+                           ) as rn
+                    FROM analyses
+                ) a ON a.project_id = p.id AND a.rn = 1
+                WHERE o.status = 'open'
+                ORDER BY
+                    CASE o.impact_potential
+                        WHEN 'high' THEN 3
+                        WHEN 'medium' THEN 2
+                        WHEN 'low' THEN 1
+                        ELSE 0
+                    END DESC,
+                    COALESCE(a.overall_score, 0) DESC
+                LIMIT 20
+            ''').fetchall()
 
             # Generate markdown
             lines = [
                 f"# AI Project Opportunities Report - {date}",
                 "",
-                "## Summary",
+                "## Global Statistics",
                 "",
                 f"- **Total projects tracked:** {total_projects}",
-                f"- **Early-burst projects detected:** {len(projects)}",
+                f"- **Early-burst projects detected (all time):** {total_early_burst}",
                 f"- **Projects analyzed today:** {total_analyzed}",
-                f"- **High-impact opportunities identified:** {len(opportunities)}",
+                f"- **Open opportunities:** {open_opportunities}",
                 "",
+                "---",
+                "",
+                "## Tech Stack Distribution",
+                ""
+            ]
+
+            if tech_distribution:
+                lines.extend(["| Tech Layer | Count |", "|------------|-------|"])
+                for row in tech_distribution:
+                    lines.append(f"| {_escape_md(row['tech_layer'])} | {row['count']} |")
+                lines.append("")
+            else:
+                lines.extend(["_No tech layer data available._", ""])
+
+            lines.extend([
+                "---",
+                "",
+                f"## Top Opportunities",
+                ""
+            ])
+
+            if top_opportunities:
+                lines.extend([
+                    "| # | Project | Opportunity | Type | Impact | Score | Difficulty | Horizon |",
+                    "|---|---------|-------------|------|--------|-------|------------|---------|"
+                ])
+                for i, opp in enumerate(top_opportunities, 1):
+                    score = opp['overall_score'] if opp['overall_score'] is not None else 'N/A'
+                    proj_name = _escape_md(opp['project_name']) or 'Unnamed'
+                    proj_url = _escape_md(opp['project_url']) or 'N/A'
+                    opp_title = _escape_md(opp['title']) or 'Untitled'
+                    opp_type = _escape_md(opp['opportunity_type']) or 'unknown'
+                    impact = _escape_md(opp['impact_potential']) or 'N/A'
+                    difficulty = _escape_md(opp['difficulty']) or 'N/A'
+                    horizon = _escape_md(opp['time_horizon']) or 'N/A'
+                    lines.append(
+                        f"| {i} | [{proj_name}]({proj_url}) | {opp_title} | "
+                        f"{opp_type} | {impact} | {score} | "
+                        f"{difficulty} | {horizon} |"
+                    )
+                lines.append("")
+            else:
+                lines.extend(["_No open opportunities found._", ""])
+
+            lines.extend([
                 "---",
                 "",
                 f"## Early-Burst Projects ({len(projects)})",
                 ""
-            ]
+            ])
 
             for i, p in enumerate(projects, 1):
-                tech = p['tech_layer'] or 'TBD'
-                app = p['application'] or 'TBD'
+                tech = _escape_md(p['tech_layer']) or 'TBD'
+                app = _escape_md(p['application']) or 'TBD'
+                proj_name = _escape_md(p['name']) or 'Unnamed'
+                proj_url = _escape_md(p['url']) or 'N/A'
+                proj_desc = _escape_md(p['description']) or 'No description'
+                lang = _escape_md(p['language']) or 'N/A'
 
                 lines.extend([
-                    f"### {i}. {p['name']}",
+                    f"### {i}. {proj_name}",
                     "",
-                    f"**Score:** {p['overall_score']:.2f} (Velocity: {p['star_velocity_score']:.2f}, Activity: {p['activity_index_score']:.2f}, Novelty: {p['novelty_score']:.2f})",
+                    f"**Score:** {p['overall_score'] or 0:.2f} (Velocity: {p['star_velocity_score'] or 0:.2f}, Activity: {p['activity_index_score'] or 0:.2f}, Novelty: {p['novelty_score'] or 0:.2f})",
                     "",
                     f"**Classification:** {tech} / {app}",
                     "",
-                    f"**Stars:** {p['stars']} | **Language:** {p['language'] or 'N/A'}",
+                    f"**Stars:** {p['stars'] or 0} | **Language:** {lang}",
                     "",
-                    f"**URL:** {p['url']}",
+                    f"**URL:** {proj_url}",
                     "",
-                    f"**Description:** {p['description'] or 'No description'}",
+                    f"**Description:** {proj_desc}",
                     "",
                     "---",
                     ""
                 ])
 
-            if opportunities:
-                lines.extend([
-                    "## Top Extension Opportunities",
-                    ""
-                ])
-
-                for opp in opportunities:
-                    lines.extend([
-                        f"### {opp['title']}",
-                        "",
-                        f"**Project:** [{opp['project_name']}]({opp['project_url']})",
-                        "",
-                        f"**Type:** {opp['opportunity_type']} | **Impact:** {opp['impact_potential']} | **Difficulty:** {opp['difficulty']} | **Time Horizon:** {opp['time_horizon']}",
-                        "",
-                        f"**Description:** {opp['description']}",
-                        "",
-                        f"**Key Insight:** {opp['key_insight'] or 'N/A'}",
-                        "",
-                        "---",
-                        ""
-                    ])
 
             # Write report
             report_path = os.path.join(
