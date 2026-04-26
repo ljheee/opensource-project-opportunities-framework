@@ -11,7 +11,11 @@ from framework.core.db import Database
 def _escape_md(text) -> str:
     if text is None:
         return ''
-    return str(text).replace('|', '\\|').replace('\n', ' ')
+    text = str(text).replace('\\', '\\\\').replace('|', '\\|')
+    text = text.replace('[', '\\[').replace(']', '\\]')
+    text = text.replace('*', '\\*').replace('_', '\\_')
+    text = text.replace('\n', ' ')
+    return text
 
 
 class ReportGenerator:

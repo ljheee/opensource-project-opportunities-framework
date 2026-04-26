@@ -20,20 +20,27 @@ class ScoringEngine:
         target_daily = max(threshold.get('daily_absolute', 10), 0.0001)
 
         # Primary: 7-day velocity
-        if past_7d is not None and past_7d > 0 and current > past_7d:
-            weekly_growth = (current - past_7d) / past_7d
-            daily_absolute = (current - past_7d) / 7
-            weekly_score = min(weekly_growth / target_weekly, 1.5)
-            daily_score = min(daily_absolute / target_daily, 1.5)
-            return min((weekly_score * 0.7 + daily_score * 0.3), 1.0)
+        if past_7d is not None and current > past_7d:
+            if past_7d > 0:
+                weekly_growth = (current - past_7d) / past_7d
+                daily_absolute = (current - past_7d) / 7
+                weekly_score = min(weekly_growth / target_weekly, 1.5)
+                daily_score = min(daily_absolute / target_daily, 1.5)
+                return min((weekly_score * 0.7 + daily_score * 0.3), 1.0)
+            else:
+                # 0 -> N stars: maximum early-burst signal
+                return 1.0
 
         # Fallback: 30-day velocity (normalize weekly growth by 4.3 weeks)
-        if past_30d is not None and past_30d > 0 and current > past_30d:
-            weekly_growth = ((current - past_30d) / past_30d) / 4.3
-            daily_absolute = (current - past_30d) / 30
-            weekly_score = min(weekly_growth / target_weekly, 1.5)
-            daily_score = min(daily_absolute / target_daily, 1.5)
-            return min((weekly_score * 0.7 + daily_score * 0.3), 1.0)
+        if past_30d is not None and current > past_30d:
+            if past_30d > 0:
+                weekly_growth = ((current - past_30d) / past_30d) / 4.3
+                daily_absolute = (current - past_30d) / 30
+                weekly_score = min(weekly_growth / target_weekly, 1.5)
+                daily_score = min(daily_absolute / target_daily, 1.5)
+                return min((weekly_score * 0.7 + daily_score * 0.3), 1.0)
+            else:
+                return 1.0
 
         return 0.5
 

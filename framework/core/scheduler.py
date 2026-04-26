@@ -1,13 +1,6 @@
 import sqlite3
 from datetime import datetime, timezone
-from enum import Enum
 from typing import List, Dict, Optional
-
-
-class TaskType(Enum):
-    BULK = "bulk"
-    INCREMENTAL = "incremental"
-    RE_EVALUATE = "re_evaluate"
 
 
 class Scheduler:
@@ -50,7 +43,7 @@ class Scheduler:
                     AND t.task_type = 'bulk'
                     AND t.status IN ('pending', 'running')
                 )
-                ORDER BY burst_score DESC, p.stars DESC
+                ORDER BY burst_score DESC, p.stars DESC, p.id ASC
                 LIMIT ?
             ''', (batch_size,))
 
@@ -94,7 +87,7 @@ class Scheduler:
                     WHERE t.project_id = p.id
                     AND t.status IN ('pending', 'running')
                 )
-                ORDER BY burst_score DESC, p.stars DESC
+                ORDER BY burst_score DESC, p.stars DESC, p.id ASC
                 LIMIT ?
             ''', (date, max_tasks))
 

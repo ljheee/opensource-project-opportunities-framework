@@ -1,6 +1,6 @@
 import sqlite3
 import os
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 from datetime import datetime, timezone
 
 
@@ -60,9 +60,15 @@ class Database:
             return
 
         # Add missing columns via ALTER TABLE (for existing schema before rebuild)
+        self._add_column_if_missing(conn, 'analyses', 'application', 'TEXT')
+        self._add_column_if_missing(conn, 'analyses', 'problem_solved', 'TEXT')
+        self._add_column_if_missing(conn, 'analyses', 'innovation_summary', 'TEXT')
+        self._add_column_if_missing(conn, 'analyses', 'differentiation', 'TEXT')
+        self._add_column_if_missing(conn, 'analyses', 'market_timing', 'TEXT')
         self._add_column_if_missing(conn, 'analyses', 'overall_score', 'INTEGER')
         self._add_column_if_missing(conn, 'analyses', 'ecosystem_position', 'TEXT')
         self._add_column_if_missing(conn, 'analyses', 'commercialization_path', 'TEXT')
+        self._add_column_if_missing(conn, 'analyses', 'analyzer_version', 'TEXT')
 
         has_check = False
         cursor = conn.execute(

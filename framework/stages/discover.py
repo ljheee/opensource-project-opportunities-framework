@@ -141,12 +141,20 @@ class DiscoverStage:
             except (ValueError, TypeError):
                 pass
 
-        # Check skip patterns
+        # Check skip patterns (whole-word match to avoid false positives)
         name = (repo.get('name') or '').lower()
         desc = (repo.get('description') or '').lower()
+        text = f"{name} {desc}"
         for pattern in filters.get('skip_patterns', []):
-            if pattern and (pattern in name or pattern in desc):
-                return True, f"skip_pattern:{pattern}"
+            if not pattern:
+                continue
+            pat_lower = pattern.lower()
+            for match in re.finditer(re.escape(pat_lower), text):
+                start, end = match.span()
+                left_ok = start == 0 or not text[start - 1].isalnum()
+                right_ok = end == len(text) or not text[end].isalnum()
+                if left_ok and right_ok:
+                    return True, f"skip_pattern:{pattern}"
 
         if repo.get('fork'):
             return True, "is_fork"
@@ -443,6 +451,11 @@ class DiscoverStage:
             "enterprise", "topics", "collections", "events", "apps", "contact",
             "security", "organizations", "new", "codespaces", "copilot", "orgs", "users",
         }
+        # Common web asset extensions that are never repositories
+        _ASSET_EXTENSIONS = {
+            '.js', '.css', '.png', '.jpg', '.jpeg', '.svg', '.ico',
+            '.woff', '.woff2', '.ttf', '.eot', '.json', '.xml', '.map',
+        }
 
         results = []
         for lang in languages:
@@ -462,6 +475,8 @@ class DiscoverStage:
                         seen.add(full_name)
                         owner = full_name.split("/")[0]
                         if owner in _NON_REPO_PREFIXES:
+                            continue
+                        if any(full_name.endswith(ext) for ext in _ASSET_EXTENSIONS):
                             continue
                         repo_names.append(full_name)
                         if len(repo_names) >= 25:

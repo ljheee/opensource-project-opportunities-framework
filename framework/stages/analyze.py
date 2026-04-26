@@ -26,6 +26,19 @@ VALID_DIFFICULTY_LEVELS = {'high', 'medium', 'low'}
 VALID_TIME_HORIZONS = {'short', 'medium', 'long'}
 
 
+def _is_whole_word(text: str, pattern: str) -> bool:
+    """Check if pattern appears as a whole word in text."""
+    if not text or not pattern:
+        return False
+    for match in re.finditer(re.escape(pattern), text, re.IGNORECASE):
+        start, end = match.span()
+        left_ok = start == 0 or not text[start - 1].isalnum()
+        right_ok = end == len(text) or not text[end].isalnum()
+        if left_ok and right_ok:
+            return True
+    return False
+
+
 def get_project_data(db: Database, project_id: str, conn=None) -> Optional[Dict]:
     """Get project and burst signal data."""
     should_close = conn is None
@@ -211,13 +224,25 @@ def extract_json_from_text(text: str) -> Optional[Dict]:
     if not isinstance(text, str):
         return None
 
-    # Try to find JSON block with braces
-    # Match nested braces properly
+    # Try to find JSON block with braces, respecting string boundaries
     stack = []
     start = -1
+    in_string = False
+    escape = False
 
     for i, char in enumerate(text):
-        if char == '{':
+        if in_string:
+            if escape:
+                escape = False
+            elif char == '\\':
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == '{':
             if not stack:
                 start = i
             stack.append('{')
@@ -226,8 +251,7 @@ def extract_json_from_text(text: str) -> Optional[Dict]:
                 stack.pop()
                 if not stack and start >= 0:
                     try:
-                        json_str = text[start:i+1]
-                        return json.loads(json_str)
+                        return json.loads(text[start:i+1])
                     except json.JSONDecodeError:
                         continue
 
@@ -274,7 +298,13 @@ def validate_analysis_output(analysis: Dict) -> tuple[bool, str, Dict]:
             score = float(score) if score else 5
         except (ValueError, TypeError):
             score = 5
-    cleaned['overall_score'] = min(10, max(1, int(score)))
+    try:
+        if score != score:  # NaN check
+            score = 5
+        score = int(score)
+    except (ValueError, OverflowError):
+        score = 5
+    cleaned['overall_score'] = min(10, max(1, score))
 
     # Ensure opportunities is a list
     opportunities = cleaned.get('opportunities')
@@ -410,24 +440,24 @@ def generate_heuristic_analysis(project: Dict) -> Dict:
         topics = []
     topics_str = ' '.join(topics).lower()
 
-    # Determine tech layer
+    # Determine tech layer (whole-word match to avoid false positives)
     tech_layer = 'ai_application'
-    if any(kw in topics_str or kw in description for kw in ['model', 'llm', 'gpt', 'foundation']):
+    if any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['model', 'llm', 'gpt', 'foundation']):
         tech_layer = 'foundation_model'
-    elif any(kw in topics_str or kw in description for kw in ['training', 'fine-tune']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['training', 'fine-tune']):
         tech_layer = 'training_framework'
-    elif any(kw in topics_str or kw in description for kw in ['inference', 'serving', 'deploy']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['inference', 'serving', 'deploy']):
         tech_layer = 'inference_engine'
-    elif any(kw in topics_str or kw in description for kw in ['tool', 'sdk', 'library']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['tool', 'sdk', 'library']):
         tech_layer = 'ai_toolchain'
 
     # Determine application
     application = 'multimodal'
-    if any(kw in topics_str or kw in description for kw in ['code', 'coding', 'developer']):
+    if any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['code', 'coding', 'developer']):
         application = 'code_generation'
-    elif any(kw in topics_str or kw in description for kw in ['image', 'vision', 'diffusion']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['image', 'vision', 'diffusion']):
         application = 'image_generation'
-    elif any(kw in topics_str or kw in description for kw in ['agent', 'autonomous']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['agent', 'autonomous']):
         application = 'agent'
 
     # Generate opportunities based on project type
@@ -570,6 +600,7 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
         except Exception as e:
             print(f"  Error analyzing {project_id}: {e}")
             try:
+                conn.rollback()
                 scheduler.mark_task_failed(task['id'], str(e)[:100], conn=conn)
                 conn.execute("UPDATE projects SET status=? WHERE id=?", (previous_status, project_id))
                 conn.commit()

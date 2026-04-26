@@ -8,6 +8,7 @@ import sys
 import json
 import sqlite3
 import argparse
+import re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
@@ -82,15 +83,30 @@ def classify_project_heuristic(project: dict) -> tuple:
 
     cfg = _get_filter_cfg()
 
+    def _is_whole_word(text: str, pattern: str) -> bool:
+        """Check if pattern appears as a whole word in text."""
+        if not text or not pattern:
+            return False
+        for match in re.finditer(re.escape(pattern), text, re.IGNORECASE):
+            start, end = match.span()
+            left_ok = start == 0 or not text[start - 1].isalnum()
+            right_ok = end == len(text) or not text[end].isalnum()
+            if left_ok and right_ok:
+                return True
+        return False
+
     # Skip patterns from config
     skip_patterns = cfg.get('skip_patterns', [])
     for pattern in skip_patterns:
-        if pattern and (pattern in name or pattern in desc):
+        if pattern and (_is_whole_word(name, pattern) or _is_whole_word(desc, pattern)):
             return False, None, None, f'skip_pattern:{pattern}'
 
     # Check for AI focus via topics and description
     ai_keywords = cfg.get('category_keywords', {}).get('ai', [])
-    has_ai_focus = any(kw and (kw in topics_str or kw in desc) for kw in ai_keywords)
+    has_ai_focus = any(
+        kw and (_is_whole_word(topics_str, kw) or _is_whole_word(desc, kw))
+        for kw in ai_keywords
+    )
 
     if not has_ai_focus:
         return False, None, None, 'no_ai_focus'
@@ -99,9 +115,9 @@ def classify_project_heuristic(project: dict) -> tuple:
     tech_layer_rules = cfg.get('tech_layer_rules', {})
     tech_layer = 'ai_application'  # default
     for layer, keywords in tech_layer_rules.items():
-        if any(kw and (kw in topics_str or kw in desc) for kw in keywords):
+        if any(kw and (_is_whole_word(topics_str, kw) or _is_whole_word(desc, kw)) for kw in keywords):
             if layer == 'foundation_model':
-                if any(kw in topics_str or kw in desc for kw in ['inference', 'serving', 'deployment']):
+                if any(_is_whole_word(topics_str, kw) or _is_whole_word(desc, kw) for kw in ['inference', 'serving', 'deployment']):
                     tech_layer = 'inference_engine'
                 else:
                     tech_layer = 'foundation_model'
