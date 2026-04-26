@@ -168,7 +168,7 @@ class ReportGenerator:
                     FROM prediction_outcomes
                     WHERE outcome != 'pending'
                     GROUP BY bucket
-                    ORDER BY overall_score_at_prediction DESC
+                    ORDER BY MIN(overall_score_at_prediction) DESC
                 ''').fetchall()
 
                 if buckets:
