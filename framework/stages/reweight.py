@@ -10,7 +10,7 @@ import os
 import sys
 import argparse
 import shutil
-import re
+import yaml
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -224,55 +224,75 @@ def backtest(rows, new_weights, new_min_score):
 
 
 def load_current_weights(config_path):
-    """Parse current weights from config.yaml."""
+    """Parse current weights and min_score from config.yaml."""
     weights = {}
     min_score = 0.65
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+            cfg = yaml.safe_load(f)
     except FileNotFoundError:
         return weights, min_score
+    except Exception:
+        return weights, min_score
 
-    # Extract min_score
-    m = re.search(r'min_score:\s*([0-9.]+)', content)
-    if m:
-        min_score = float(m.group(1))
-
-    # Extract weights under metrics
+    eb = cfg.get('early_burst') or {}
+    min_score = eb.get('min_score', 0.65)
+    metrics = eb.get('metrics', {})
     for comp in COMPONENTS:
-        # Match pattern like "star_velocity:\n      weight: 0.35"
-        pattern = rf'{comp}:\s*\n\s+weight:\s*([0-9.]+)'
-        m = re.search(pattern, content)
-        if m:
-            weights[comp] = float(m.group(1))
-        else:
-            weights[comp] = 0.25
-
+        weights[comp] = metrics.get(comp, {}).get('weight', 0.25)
     return weights, min_score
 
 
 def apply_config_changes(config_path, new_weights, new_min_score):
-    """Update config.yaml with new weights and min_score."""
+    """Update config.yaml with new weights and min_score.
+
+    Uses a line-by-line state machine to preserve comments, ordering,
+    and formatting as much as possible.
+    """
     with open(config_path, 'r', encoding='utf-8') as f:
-        content = f.read()
+        lines = f.readlines()
 
-    # Update min_score
-    content = re.sub(
-        r'(min_score:\s*)[0-9.]+',
-        lambda m: f"{m.group(1)}{new_min_score}",
-        content
-    )
+    in_early_burst = False
+    in_metrics = False
+    current_component = None
 
-    # Update each weight
-    for comp, weight in new_weights.items():
-        content = re.sub(
-            rf'({comp}:\s*\n\s+weight:\s*)[0-9.]+',
-            lambda m, w=weight: f"{m.group(1)}{w:.4f}",
-            content
-        )
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Track nesting
+        if stripped.startswith('early_burst:'):
+            in_early_burst = True
+            in_metrics = False
+            current_component = None
+            continue
+
+        if in_early_burst and stripped == 'metrics:':
+            in_metrics = True
+            continue
+
+        # Detect component sections under metrics
+        if in_metrics and not stripped.startswith('-') and stripped.endswith(':'):
+            comp_key = stripped.rstrip(':')
+            if comp_key in COMPONENTS:
+                current_component = comp_key
+            else:
+                current_component = None
+            continue
+
+        # Update min_score
+        if in_early_burst and not in_metrics and stripped.startswith('min_score:'):
+            prefix = line[:line.index('min_score:') + len('min_score:')]
+            lines[i] = f"{prefix} {new_min_score}\n"
+            continue
+
+        # Update weight lines
+        if current_component and stripped.startswith('weight:'):
+            prefix = line[:line.index('weight:') + len('weight:')]
+            lines[i] = f"{prefix} {new_weights[current_component]:.4f}\n"
+            continue
 
     with open(config_path, 'w', encoding='utf-8') as f:
-        f.write(content)
+        f.writelines(lines)
 
 
 def print_proposal(rows, current_weights, current_min_score,

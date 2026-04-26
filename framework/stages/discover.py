@@ -84,7 +84,7 @@ class DiscoverStage:
 
                 # Handle rate limiting
                 if response.status_code == 403 and 'rate limit' in response.text.lower():
-                    reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
+                    reset_time = int(response.headers.get('X-RateLimit-Reset') or 0)
                     wait_time = max(reset_time - int(time.time()), 60)
                     print(f"  Rate limited. Waiting {wait_time}s...")
                     time.sleep(min(wait_time, 3600))
@@ -93,7 +93,7 @@ class DiscoverStage:
                     continue
 
                 if response.status_code == 429:
-                    retry_after = max(int(response.headers.get('Retry-After', 60)), 0)
+                    retry_after = max(int(response.headers.get('Retry-After') or 60), 0)
                     print(f"  Too many requests. Waiting {retry_after}s...")
                     time.sleep(min(retry_after, retry_delay))
                     if attempt >= max_retries - 1:

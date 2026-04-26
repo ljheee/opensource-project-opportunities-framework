@@ -557,9 +557,20 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
         # Detect cursor/agent mode: prompt via stdin; claude mode: prompt via -p arg
         is_agent = os.path.basename(cmd) in ('agent', 'cursor-agent')
 
-        # Avoid duplicate -p when CLI_TOOL already contains it
+        # Avoid duplicate -p when CLI_TOOL already contains it.
+        # Remove both the flag and its following argument value.
         if not is_agent:
-            extra_args = [arg for arg in extra_args if arg != '-p']
+            deduped = []
+            skip_next = False
+            for arg in extra_args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg == '-p':
+                    skip_next = True
+                    continue
+                deduped.append(arg)
+            extra_args = deduped
 
         cfg = resilience_config or {}
         max_retries = cfg.get('max_retries', 2)

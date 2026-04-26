@@ -3,7 +3,6 @@ name: Daily Discover
 on:
   schedule:
     - cron: '0 1 * * *'
-    - cron: '0 1 1 * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -53,11 +52,18 @@ jobs:
         run: python framework/stages/report.py --date "$(date -u +%Y-%m-%d)"
 
       - name: Validate Predictions
-        if: github.event.schedule == '0 1 * * 1' || github.event.inputs.mode == 'bulk'
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'bulk'
         run: python framework/stages/validate.py
 
+      - name: Auto-tune Weights
+        if: github.event_name == 'schedule' && github.event.schedule == '0 1 * * *' && $(date -u +%d) == '01'
+        run: python framework/stages/reweight.py --dry-run
+
       - name: Checkpoint WAL
-        run: sqlite3 data/framework.db "PRAGMA wal_checkpoint(TRUNCATE);" || true
+        run: |
+          if [ -f data/framework.db ]; then
+            sqlite3 data/framework.db "PRAGMA wal_checkpoint(TRUNCATE);"
+          fi
 
       - name: Commit & Push
         run: |
@@ -65,33 +71,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
           git diff --staged --quiet || git commit -m "chore: $MODE run $(date -u +%Y-%m-%d)"
-          git push
-
-  reweight:
-    runs-on: ubuntu-latest
-    if: github.event.schedule == '0 1 1 * *'
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: pip install -r requirements.txt
-
-      - name: Init DB
-        run: python framework/stages/init_db.py
-
-      - name: Auto-tune Weights
-        run: python framework/stages/reweight.py --dry-run
-
-      - name: Checkpoint WAL
-        run: sqlite3 data/framework.db "PRAGMA wal_checkpoint(TRUNCATE);" || true
-
-      - name: Commit & Push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/
-          git diff --staged --quiet || git commit -m "chore: monthly weight audit $(date -u +%Y-%m-%d)"
           git push
