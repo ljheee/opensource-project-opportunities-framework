@@ -26,9 +26,10 @@ VALID_DIFFICULTY_LEVELS = {'high', 'medium', 'low'}
 VALID_TIME_HORIZONS = {'short', 'medium', 'long'}
 
 
-def get_project_data(db: Database, project_id: str) -> Optional[Dict]:
+def get_project_data(db: Database, project_id: str, conn=None) -> Optional[Dict]:
     """Get project and burst signal data."""
-    conn = db.get_conn()
+    should_close = conn is None
+    conn = conn or db.get_conn()
     try:
         proj = conn.execute(
             "SELECT * FROM projects WHERE id=?",
@@ -52,7 +53,8 @@ def get_project_data(db: Database, project_id: str) -> Optional[Dict]:
 
         return proj_dict
     finally:
-        conn.close()
+        if should_close:
+            conn.close()
 
 
 def get_pending_analysis_tasks(db: Database, date: str, limit: int = 10) -> List[Dict]:
@@ -98,9 +100,10 @@ def validate_opportunity(opp: Dict) -> tuple[bool, str]:
     return True, ""
 
 
-def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Dict) -> int:
+def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Dict, conn=None) -> int:
     """Store analysis results and opportunities atomically."""
-    conn = db.get_conn()
+    should_close = conn is None
+    conn = conn or db.get_conn()
     opportunities_stored = 0
 
     try:
@@ -191,18 +194,23 @@ def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Di
                 ))
             opportunities_stored += 1
 
-        conn.commit()
+        if should_close:
+            conn.commit()
         return opportunities_stored
 
     except Exception as e:
         conn.rollback()
         raise e
     finally:
-        conn.close()
+        if should_close:
+            conn.close()
 
 
 def extract_json_from_text(text: str) -> Optional[Dict]:
     """Extract JSON object from text, handling various formats."""
+    if not isinstance(text, str):
+        return None
+
     # Try to find JSON block with braces
     # Match nested braces properly
     stack = []
@@ -239,38 +247,47 @@ def extract_json_from_text(text: str) -> Optional[Dict]:
         return None
 
 
-def validate_analysis_output(analysis: Dict) -> tuple[bool, str]:
-    """Validate that LLM output has required structure."""
+def validate_analysis_output(analysis: Dict) -> tuple[bool, str, Dict]:
+    """Validate that LLM output has required structure.
+
+    Returns (is_valid, error_message, cleaned_analysis).  The returned
+    dictionary is a shallow copy with overall_score clamped and
+    opportunities guaranteed to be a list.
+    """
     if not isinstance(analysis, dict):
-        return False, "Analysis is not a dictionary"
+        return False, "Analysis is not a dictionary", {}
+
+    cleaned = dict(analysis)
 
     # Check required fields
     required_fields = ['tech_layer', 'application', 'problem_solved',
                        'innovation_summary', 'differentiation', 'market_timing',
                        'ecosystem_position', 'commercialization_path']
     for field in required_fields:
-        if field not in analysis:
-            return False, f"Missing required field: {field}"
+        if field not in cleaned:
+            return False, f"Missing required field: {field}", cleaned
 
     # Validate overall_score is numeric and clamp to [1, 10]
-    score = analysis.get('overall_score')
+    score = cleaned.get('overall_score')
     if not isinstance(score, (int, float)):
         try:
             score = float(score) if score else 5
         except (ValueError, TypeError):
             score = 5
-    analysis['overall_score'] = min(10, max(1, int(score)))
+    cleaned['overall_score'] = min(10, max(1, int(score)))
 
     # Ensure opportunities is a list
-    opportunities = analysis.get('opportunities')
+    opportunities = cleaned.get('opportunities')
     if not isinstance(opportunities, list):
-        analysis['opportunities'] = []
+        cleaned['opportunities'] = []
 
-    return True, ""
+    return True, "", cleaned
 
 
 def _format_prompt(template: str, values: Dict[str, str]) -> str:
     """Replace only known placeholders, leaving all other braces untouched."""
+    if not values:
+        return template
     pattern = re.compile(r'\{(' + '|'.join(re.escape(k) for k in values) + r')\}')
     return pattern.sub(lambda m: str(values.get(m.group(1), m.group(0))), template)
 
@@ -356,7 +373,7 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
                     return None
 
                 # Validate output structure
-                valid, error = validate_analysis_output(analysis)
+                valid, error, analysis = validate_analysis_output(analysis)
                 if not valid:
                     print(f"  Invalid LLM output (attempt {attempt}/{max_retries}): {error}")
                     if attempt < max_retries:
@@ -513,7 +530,7 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
             conn.commit()
 
             # Get project data
-            project = get_project_data(db, project_id)
+            project = get_project_data(db, project_id, conn=conn)
             if not project:
                 print(f"  Project not found: {project_id}")
                 scheduler.mark_task_failed(task['id'], 'project_not_found', conn=conn)
@@ -531,8 +548,10 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
                 print(f"  Using heuristic analysis (LLM unavailable)")
                 analysis = generate_heuristic_analysis(project)
 
-            # Store analysis and opportunities atomically
-            opportunities_count = store_analysis_and_opportunities(db, project_id, analysis)
+            # Store analysis and opportunities atomically (shared conn)
+            opportunities_count = store_analysis_and_opportunities(
+                db, project_id, analysis, conn=conn
+            )
 
             # Mark task complete and project as active (same transaction)
             scheduler.mark_task_done(task['id'], opportunities_count, conn=conn)

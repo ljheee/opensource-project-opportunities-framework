@@ -259,9 +259,9 @@ class Database:
         try:
             if not self._table_exists(conn, 'tasks'):
                 return
-            # Reset tasks stuck in 'running' back to 'pending' and bump date to today
+            # Reset tasks stuck in 'running' back to 'pending'
             conn.execute("""
-                UPDATE tasks SET status='pending', started_at=NULL, task_date=date('now')
+                UPDATE tasks SET status='pending', started_at=NULL
                 WHERE status='running'
             """)
             # Bump old pending tasks to today so they remain schedulable
@@ -295,9 +295,18 @@ class Database:
                   )
             """)
             # Priority 3: remaining → reset to discovered
+            # Exclude projects already handled by Priority 1 or 2
             conn.execute("""
                 UPDATE projects SET status='discovered'
                 WHERE status='analyzing'
+                  AND id NOT IN (
+                      SELECT DISTINCT project_id FROM tasks
+                      WHERE task_type IN ('bulk','incremental','triggered')
+                        AND status IN ('pending','running')
+                  )
+                  AND id NOT IN (
+                      SELECT DISTINCT project_id FROM tasks WHERE status='done'
+                  )
             """)
             conn.commit()
         finally:
@@ -332,8 +341,10 @@ class Database:
         try:
             now = datetime.now(timezone.utc).isoformat()
             conn.execute('''
-                INSERT OR REPLACE INTO star_history (project_id, sampled_at, stars)
+                INSERT INTO star_history (project_id, sampled_at, stars)
                 VALUES (?, substr(?, 1, 10), ?)
+                ON CONFLICT(project_id, sampled_at) DO UPDATE SET
+                    stars = excluded.stars
             ''', (project_id, now, stars))
             if should_close:
                 conn.commit()

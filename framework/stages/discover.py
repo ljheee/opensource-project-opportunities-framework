@@ -153,17 +153,17 @@ class DiscoverStage:
 
         # Check required filters from config
         required = filters.get('required', {})
-        if required.get('has_code') and repo.get('size', 0) == 0:
+        if required.get('has_code') and (repo.get('size') or 0) == 0:
             return True, "empty_repo"
 
         return False, ""
 
-    def _upsert_project(self, repo: Dict, source: str, signal: str,
-                        conn=None, _upsert_counter: list = None):
+    def _upsert_project(self, repo: Dict, source: str, signal: str, conn=None):
         """Insert or update project in database.
 
-        When called with a shared connection and counter, accumulates
-        and commits every 100 upserts.
+        Uses the provided connection if available; otherwise opens and closes
+        its own.  Does NOT commit — the caller is responsible for committing
+        the transaction.
         """
         should_close = conn is None
         conn = conn or self.db.get_conn()
@@ -246,12 +246,6 @@ class DiscoverStage:
                 now
             ))
 
-            if _upsert_counter is not None:
-                _upsert_counter[0] += 1
-                if _upsert_counter[0] % 100 == 0:
-                    conn.commit()
-            else:
-                conn.commit()
             return project_id
         finally:
             if should_close:
@@ -294,7 +288,10 @@ class DiscoverStage:
 
             now = datetime.now(timezone.utc)
             for sample in history:
-                sample_date = datetime.fromisoformat(sample['sampled_at']).date()
+                sampled_at = sample.get('sampled_at')
+                if not sampled_at:
+                    continue
+                sample_date = datetime.fromisoformat(sampled_at).date()
                 days_ago = (now.date() - sample_date).days
 
                 if 6 <= days_ago <= 8 and stars_7d_ago is None:
@@ -543,12 +540,11 @@ class DiscoverStage:
         stored_count = 0
         conn = self.db.get_conn()
         try:
-            upsert_counter = [0]
             for item in unique_results:
                 try:
                     project_id = self._upsert_project(
                         item['repo'], item['source'], item['signal'],
-                        conn=conn, _upsert_counter=upsert_counter
+                        conn=conn
                     )
                     self._sample_star_count(
                         project_id,

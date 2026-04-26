@@ -82,6 +82,7 @@ class Scheduler:
                 AND NOT EXISTS (
                     SELECT 1 FROM tasks t
                     WHERE t.project_id = p.id
+                    AND t.task_type = 'incremental'
                     AND t.task_date = ?
                 )
                 AND NOT EXISTS (
@@ -113,10 +114,12 @@ class Scheduler:
         should_close = conn is None
         conn = conn or self.get_conn()
         try:
-            conn.execute("""
+            cursor = conn.execute("""
                 UPDATE tasks SET status = 'running', started_at = ?
                 WHERE id = ?
             """, (datetime.now(timezone.utc).isoformat(), task_id))
+            if cursor.rowcount == 0:
+                raise ValueError(f"Task {task_id} not found or already running")
             if should_close:
                 conn.commit()
         finally:
@@ -128,10 +131,12 @@ class Scheduler:
         should_close = conn is None
         conn = conn or self.get_conn()
         try:
-            conn.execute("""
+            cursor = conn.execute("""
                 UPDATE tasks SET status = 'done', finished_at = ?, opportunities_found = ?
                 WHERE id = ?
             """, (datetime.now(timezone.utc).isoformat(), opportunities_found, task_id))
+            if cursor.rowcount == 0:
+                raise ValueError(f"Task {task_id} not found")
             if should_close:
                 conn.commit()
         finally:
@@ -143,10 +148,12 @@ class Scheduler:
         should_close = conn is None
         conn = conn or self.get_conn()
         try:
-            conn.execute("""
+            cursor = conn.execute("""
                 UPDATE tasks SET status = 'failed', finished_at = ?, trigger_reason = ?
                 WHERE id = ?
             """, (datetime.now(timezone.utc).isoformat(), error_message or 'analysis_failed', task_id))
+            if cursor.rowcount == 0:
+                raise ValueError(f"Task {task_id} not found")
             if should_close:
                 conn.commit()
         finally:
