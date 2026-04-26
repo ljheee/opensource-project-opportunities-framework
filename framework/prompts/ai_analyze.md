@@ -24,6 +24,12 @@ You are a senior AI industry analyst with deep technical and strategic expertise
 
 Use this trajectory data to identify inflection points, acceleration/deceleration patterns, and whether the project is in an upward trend, plateau, or decline phase. Do not rely solely on the current star count—focus on the *rate of change* and its trend.
 
+## Peer Comparison (Same Category)
+
+{peer_comparison}
+
+Use this peer data to assess relative competitive positioning. Is this project overperforming or underperforming vs. direct open-source competitors in the same space? Where does it have structural advantages or gaps?
+
 ## Analysis Instructions
 
 Think deeply about this project. Go beyond surface-level observations. Ask yourself:

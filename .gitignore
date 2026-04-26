@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Claude IDE sessions
+.claude/
+
+# SQLite temp files
+*.db-shm
+*.db-wal
+*.db.fresh
+*.db.fresh-shm
+*.db.fresh-wal
+
+# Test databases
+test_*.db*
+
+# Data artifacts (keep .gitkeep but ignore generated content)
+data/*.db
+!data/.gitkeep
+data/reports/*.md
+!data/reports/.gitkeep
+
+# Generated reports
+reports/
+
+# Python
+__pycache__/
+*.pyc

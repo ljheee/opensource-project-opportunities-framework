@@ -388,3 +388,27 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
         finally:
             conn.close()
+
+    def get_peer_projects(self, project_id: str, tech_layer: str,
+                          application: str, limit: int = 5,
+                          conn=None) -> List[Dict]:
+        """Find peer projects in the same category for comparison."""
+        should_close = conn is None
+        conn = conn or self.get_conn()
+        try:
+            cursor = conn.execute('''
+                SELECT id, name, url, stars, created_at,
+                       tech_layer, application
+                FROM projects
+                WHERE id != ?
+                  AND tech_layer = ?
+                  AND application = ?
+                  AND status IN ('active', 'scheduled')
+                ORDER BY stars DESC
+                LIMIT ?
+            ''', (project_id, tech_layer or 'ai_application',
+                  application or 'multimodal', limit))
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            if should_close:
+                conn.close()

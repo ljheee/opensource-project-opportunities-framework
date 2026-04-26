@@ -77,6 +77,15 @@ def get_project_data(db: Database, project_id: str, conn=None) -> Optional[Dict]
         else:
             proj_dict['star_history'] = db.get_project_star_history(project_id, days=30)
 
+        # Get peer projects for competitive context
+        proj_dict['peers'] = db.get_peer_projects(
+            project_id,
+            proj_dict.get('tech_layer'),
+            proj_dict.get('application'),
+            limit=5,
+            conn=conn
+        )
+
         return proj_dict
     finally:
         if should_close:
@@ -373,6 +382,20 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
     else:
         star_trajectory = "_No star history data available._"
 
+    # Format peer comparison for competitive context
+    peers = project.get('peers', [])
+    if peers:
+        peer_lines = ["| Project | Stars | URL |"]
+        peer_lines.append("|---------|-------|-----|")
+        for peer in peers:
+            peer_name = peer.get('name') or 'Unknown'
+            peer_stars = peer.get('stars') or 0
+            peer_url = peer.get('url') or 'N/A'
+            peer_lines.append(f"| {peer_name} | {peer_stars} | {peer_url} |")
+        peer_comparison = "\n".join(peer_lines)
+    else:
+        peer_comparison = "_No peer projects found in this category._"
+
     prompt = _format_prompt(prompt_template, {
         'name': project.get('name') or 'Unknown',
         'url': project.get('url') or 'N/A',
@@ -385,6 +408,7 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
         'activity_index': (project.get('burst_signals') or {}).get('activity_index_score') or 'N/A',
         'novelty': (project.get('burst_signals') or {}).get('novelty_score') or 'N/A',
         'star_trajectory': star_trajectory,
+        'peer_comparison': peer_comparison,
     })
 
     try:
