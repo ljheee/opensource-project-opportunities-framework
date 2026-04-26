@@ -141,9 +141,18 @@ class ReportGenerator:
                     SELECT AVG(growth_rate_actual) FROM prediction_outcomes
                     WHERE outcome = 'false_positive'
                 ''').fetchone()[0] or 0
+                avg_pred_tp = conn.execute('''
+                    SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
+                    WHERE outcome = 'true_positive'
+                ''').fetchone()[0] or 0
+                avg_pred_fp = conn.execute('''
+                    SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
+                    WHERE outcome = 'false_positive'
+                ''').fetchone()[0] or 0
                 lines.append(f"- **Predictions evaluated:** {total_evaluated} (TP: {tp_count}, FP: {fp_count})")
                 lines.append(f"- **Precision (7d+ horizon):** {precision:.1%}")
                 lines.append(f"- **Avg actual growth — TP:** {avg_tp:.1f} stars/day, FP: {avg_fp:.1f} stars/day")
+                lines.append(f"- **Avg predicted growth — TP:** {avg_pred_tp:.1f} stars/day, FP: {avg_pred_fp:.1f} stars/day")
 
                 # Score bucket calibration table
                 buckets = conn.execute('''
@@ -234,7 +243,7 @@ class ReportGenerator:
                 lines.extend([
                     f"### {i}. {proj_name}",
                     "",
-                    f"**Score:** {p['overall_score'] or 0:.2f} (Velocity: {p['star_velocity_score'] or 0:.2f}, Activity: {p['activity_index_score'] or 0:.2f}, Novelty: {p['novelty_score'] or 0:.2f})",
+                    f"**Score:** {p['overall_score'] or 0:.2f} (Velocity: {p['star_velocity_score'] or 0:.2f}, Activity: {p['activity_index_score'] or 0:.2f}, Buzz: {p['community_buzz_score'] or 0:.2f}, Novelty: {p['novelty_score'] or 0:.2f})",
                     "",
                     f"**Classification:** {tech} / {app}",
                     "",

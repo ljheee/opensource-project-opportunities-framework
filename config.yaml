@@ -69,6 +69,7 @@ early_burst:
     community_buzz:
       weight: 0.25
       thresholds:
+        default_score: 0.3
         hn_mentions: 1
         reddit_mentions: 2
     novelty_signal:

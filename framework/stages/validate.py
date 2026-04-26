@@ -41,18 +41,21 @@ def record_new_predictions(db: Database):
 
         recorded = 0
         for row in cur.fetchall():
+            predicted_growth = max((row['overall_score'] or 0) * 8, 1)
             conn.execute('''
                 INSERT INTO prediction_outcomes
                 (project_id, predicted_at, stars_at_prediction,
                  overall_score_at_prediction,
                  star_velocity_at_pred, activity_index_at_pred,
                  community_buzz_at_pred, novelty_at_pred,
+                 growth_rate_predicted,
                  checked_at, outcome)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, date('now'), 'pending')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, date('now'), 'pending')
             ''', (row['project_id'], row['calculated_at'],
                   row['stars'], row['overall_score'],
                   row['star_velocity_score'], row['activity_index_score'],
-                  row['community_buzz_score'], row['novelty_score']))
+                  row['community_buzz_score'], row['novelty_score'],
+                  predicted_growth))
             recorded += 1
 
         conn.commit()
@@ -70,7 +73,9 @@ def check_pending_outcomes(db: Database, min_days: int = 7):
         cur = conn.execute('''
             SELECT po.id, po.project_id, po.stars_at_prediction,
                    po.overall_score_at_prediction, po.predicted_at,
-                   p.stars as stars_now
+                   po.growth_rate_predicted,
+                   p.stars as stars_now,
+                   CAST(julianday('now') - julianday(po.predicted_at) AS INTEGER) as days_elapsed
             FROM prediction_outcomes po
             JOIN projects p ON po.project_id = p.id
             WHERE po.outcome = 'pending'
@@ -81,16 +86,18 @@ def check_pending_outcomes(db: Database, min_days: int = 7):
         for row in cur.fetchall():
             stars_then = row['stars_at_prediction'] or 0
             stars_now = row['stars_now'] or 0
-            days = max((row['predicted_at'] and 7) or 7, 1)
+            days = max(row['days_elapsed'] or min_days, 1)
 
             # Actual growth rate per day
             actual_growth = (stars_now - stars_then) / days
 
             # Predicted trajectory: overall_score maps roughly to expected growth
-            # score >= 0.65 (min early-burst) → expect at least 5 stars/day
-            predicted_growth = max((row['overall_score_at_prediction'] or 0) * 8, 1)
+            predicted_growth = row['growth_rate_predicted'] or max((row['overall_score_at_prediction'] or 0) * 8, 1)
 
-            if actual_growth >= predicted_growth * 0.5:
+            # Fast-path: star decline or zero growth is always false positive
+            if stars_now <= stars_then:
+                outcome = 'false_positive'
+            elif actual_growth >= predicted_growth * 0.5:
                 outcome = 'true_positive'
             else:
                 outcome = 'false_positive'
@@ -100,9 +107,10 @@ def check_pending_outcomes(db: Database, min_days: int = 7):
                 SET checked_at = date('now'),
                     stars_now = ?,
                     growth_rate_actual = ?,
+                    growth_rate_predicted = ?,
                     outcome = ?
                 WHERE id = ?
-            ''', (stars_now, actual_growth, outcome, row['id']))
+            ''', (stars_now, actual_growth, predicted_growth, outcome, row['id']))
             updated += 1
 
         conn.commit()

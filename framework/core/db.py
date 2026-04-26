@@ -44,6 +44,7 @@ class Database:
         self._add_column_if_missing(conn, 'prediction_outcomes', 'activity_index_at_pred', 'REAL')
         self._add_column_if_missing(conn, 'prediction_outcomes', 'community_buzz_at_pred', 'REAL')
         self._add_column_if_missing(conn, 'prediction_outcomes', 'novelty_at_pred', 'REAL')
+        self._add_column_if_missing(conn, 'prediction_outcomes', 'growth_rate_predicted', 'REAL')
 
     def _migrate_analyses(self, conn):
         """Migrate analyses table: add missing columns and CHECK constraint via table rebuild."""
@@ -274,6 +275,7 @@ class Database:
                 activity_index_at_pred REAL,
                 community_buzz_at_pred REAL,
                 novelty_at_pred REAL,
+                growth_rate_predicted REAL,
                 checked_at TEXT,
                 stars_now INTEGER,
                 growth_rate_actual REAL,

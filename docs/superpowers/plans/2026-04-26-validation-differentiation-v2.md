@@ -244,11 +244,11 @@ Percentile in peer group: 67% (above 2 of 3 peers)
 |--------|------|------|------|
 | P0 | Acceleration scoring | ✅ 已落地 | 本周 star 增长斜率是前 2 周的几倍 |
 | P0 | Validation table + script | ✅ 已落地 | prediction_outcomes + validate.py |
-| P0 | Peer Radar | ⬜ **待实现** | 同类别竞品对比（差异化核心） |
+| P0 | Peer Radar | ✅ 已落地 | 同类别竞品对比 + percentile 计算 |
 | P1 | Trajectory in LLM prompt | ✅ 已落地 | Star history 表格加入 prompt |
-| P1 | Inflection Point Detection | ⬜ **待实现** | 斜率变化检测 + 阶段判定 |
-| P1 | Report validation metrics | ⚠️ 基础版 | 需要细化 score bucket calibration |
-| P2 | Weight auto-tuning | ⬜ 待实现 | 基于 validation 结果自动调权重 |
+| P1 | Inflection Point Detection | ✅ 已落地 | 斜率变化检测 + 阶段判定 |
+| P1 | Report validation metrics | ✅ 已落地 | score bucket calibration 表格 |
+| P2 | Weight auto-tuning | ✅ 已落地 | reweight.py --dry-run / --apply |
 
 ---
 
