@@ -12,6 +12,7 @@ import re
 import requests
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Set
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
@@ -164,6 +165,10 @@ class DiscoverStage:
         if required.get('has_code') and (repo.get('size') or 0) == 0:
             return True, "empty_repo"
 
+        # Proxy for has_readme: GitHub usually populates description from README
+        if required.get('has_readme') and not repo.get('description'):
+            return True, "no_readme"
+
         return False, ""
 
     def _upsert_project(self, repo: Dict, source: str, signal: str, conn=None):
@@ -314,8 +319,23 @@ class DiscoverStage:
             velocity_score = self.scoring.calculate_star_velocity(
                 current_stars, stars_7d_ago, stars_30d_ago
             )
+            # Estimate commit frequency from last push date (pushed_at -> last_commit_at)
+            last_commit = proj['last_commit_at'] or ''
+            commit_frequency = 1.0
+            if last_commit:
+                try:
+                    last_dt = datetime.fromisoformat(last_commit.replace('Z', '+00:00'))
+                    days = (datetime.now(timezone.utc) - last_dt).days
+                    if days <= 7:
+                        commit_frequency = 5.0
+                    elif days <= 30:
+                        commit_frequency = 2.0
+                    else:
+                        commit_frequency = 0.5
+                except (ValueError, TypeError):
+                    pass
             activity_score = self.scoring.calculate_activity_index(
-                proj['open_issues'] or 0, 3
+                proj['open_issues'] or 0, commit_frequency
             )
             novelty_score = self.scoring.calculate_novelty(
                 proj['first_commit_at'] or proj['created_at'], 1
@@ -460,7 +480,7 @@ class DiscoverStage:
         results = []
         for lang in languages:
             for period in periods:
-                url = f"https://github.com/trending/{lang}?since={period}"
+                url = f"https://github.com/trending/{quote(lang, safe='')}?since={period}"
                 try:
                     r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
                     r.raise_for_status()
@@ -564,13 +584,13 @@ class DiscoverStage:
                         item['repo'], item['source'], item['signal'],
                         conn=conn
                     )
+                    stored_count += 1
                     self._sample_star_count(
                         project_id,
                         (item.get('repo') or {}).get('stargazers_count') or 0,
                         conn=conn
                     )
                     self._calculate_and_store_burst_score(project_id, conn=conn)
-                    stored_count += 1
                 except Exception as e:
                     repo_name = (item.get('repo') or {}).get('full_name', 'unknown')
                     print(f"  Error storing {repo_name}: {e}")

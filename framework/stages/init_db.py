@@ -10,6 +10,8 @@ from framework.core.db import Database
 def main():
     db = Database()
     db.init_tables()
+    db.repair_analyzing_status()
+    db.repair_orphan_records()
     print("Database initialized successfully.")
 
 

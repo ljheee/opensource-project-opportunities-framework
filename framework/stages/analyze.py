@@ -8,6 +8,7 @@ import sys
 import json
 import argparse
 import re
+import shlex
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -355,7 +356,7 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
 
     try:
         # Handle CLI_TOOL that may contain spaces (e.g., "claude --dangerously-skip-permissions")
-        cli_parts = cli_tool.split()
+        cli_parts = shlex.split(cli_tool)
         if not cli_parts:
             print("  CLI tool is empty")
             return None

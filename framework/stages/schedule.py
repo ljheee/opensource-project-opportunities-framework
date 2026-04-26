@@ -33,6 +33,9 @@ def main():
         scheduling_cfg = config.get_scheduling_config()
         incremental_cfg = scheduling_cfg.get('incremental', {})
         max_tasks = incremental_cfg.get('max_per_day', 15)
+        if max_tasks <= 0:
+            print("ERROR: incremental max_per_day must be a positive integer")
+            sys.exit(1)
         count = scheduler.generate_incremental_tasks(today, max_tasks)
 
     print(f"Generated {count} tasks for {today}")

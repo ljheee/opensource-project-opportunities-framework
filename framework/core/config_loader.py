@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import List, Dict, Optional, Any
 import yaml
 import os
@@ -54,10 +54,11 @@ class ConfigLoader:
 
     def get_category(self) -> CategoryConfig:
         cat = self._require_key('category')
-        return CategoryConfig(**cat)
+        valid_keys = {f.name for f in fields(CategoryConfig)}
+        return CategoryConfig(**{k: v for k, v in cat.items() if k in valid_keys})
 
     def get_dimensions(self) -> DimensionsConfig:
-        dims = self._require_key('dimensions')
+        dims = self._require_key('dimensions') or {}
         return DimensionsConfig(
             tech_layer=dims.get('tech_layer', []),
             application=dims.get('application', [])
@@ -65,14 +66,15 @@ class ConfigLoader:
 
     def get_early_burst_config(self) -> EarlyBurstConfig:
         eb = self._require_key('early_burst')
-        return EarlyBurstConfig(**eb)
+        valid_keys = {f.name for f in fields(EarlyBurstConfig)}
+        return EarlyBurstConfig(**{k: v for k, v in eb.items() if k in valid_keys})
 
     def get_github_topics(self) -> List[str]:
-        topics = self.load().get('sources', {}).get('github', {}).get('topics', [])
+        topics = ((self.load().get('sources') or {}).get('github') or {}).get('topics', [])
         return topics if isinstance(topics, list) else []
 
     def get_star_range(self) -> tuple:
-        raw = self.load().get('sources', {}).get('github', {}).get('star_range', [50, 50000])
+        raw = ((self.load().get('sources') or {}).get('github') or {}).get('star_range', [50, 50000])
         if not isinstance(raw, (list, tuple)) or len(raw) != 2:
             return (50, 50000)
         try:
@@ -85,14 +87,14 @@ class ConfigLoader:
         return (min_val, max_val)
 
     def get_ecosystems(self) -> List[str]:
-        ecosystems = self.load().get('sources', {}).get('ecosystems', [])
+        ecosystems = (self.load().get('sources') or {}).get('ecosystems', [])
         return ecosystems if isinstance(ecosystems, list) else []
 
     def get_filters(self) -> Dict:
-        return self.load().get('filters', {})
+        return self.load().get('filters') or {}
 
     def get_scheduling_config(self) -> Dict:
-        return self.load().get('scheduling', {})
+        return self.load().get('scheduling') or {}
 
     def get_resilience_config(self) -> Dict:
-        return self.load().get('resilience', {})
+        return self.load().get('resilience') or {}
