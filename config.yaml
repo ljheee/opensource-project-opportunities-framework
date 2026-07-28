@@ -41,6 +41,9 @@ sources:
       - "ai-agents"
     languages: ["Python", "TypeScript", "Rust", "Go"]
     star_range: [50, 50000]
+    created_within_days: 730
+    backfill_max_pages: 30
+    backfill_max_per_day: 50
 
   trending:
     languages: ["python", "typescript", "rust", "go"]
@@ -57,21 +60,21 @@ early_burst:
   min_score: 0.65
   metrics:
     star_velocity:
-      weight: 0.35
+      weight: 0.45
       thresholds:
         weekly_growth_rate: 0.15
         daily_absolute: 10
     activity_index:
-      weight: 0.25
+      weight: 0.35
       thresholds:
         commit_frequency: 3
         pr_merge_rate: 0.3
     community_buzz:
-      weight: 0.25
+      weight: 0.0
       thresholds:
         default_score: 0.3
     novelty_signal:
-      weight: 0.15
+      weight: 0.20
       thresholds:
         first_commit_within_months: 6
         unique_contributors_weekly: 2
@@ -140,6 +143,9 @@ scheduling:
     max_per_day: 100
   incremental:
     max_per_day: 15
+    star_change_threshold: 0.05
+    recent_commit_days: 3
+    min_reanalyze_days: 7
 
 resilience:
   github_api:
