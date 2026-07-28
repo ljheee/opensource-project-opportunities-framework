@@ -746,73 +746,20 @@ def generate_heuristic_analysis(project: Dict) -> Dict:
     elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['eval', 'benchmark', 'safety', 'test']):
         application = 'model_evaluation'
 
-    # Generate opportunities based on project type
-    opportunities = []
-
-    if tech_layer == 'foundation_model':
-        opportunities.extend([
-            {
-                'opportunity_type': 'integration',
-                'title': 'LangChain/LlamaIndex Integration',
-                'description': 'Build official integration with popular orchestration frameworks',
-                'impact_potential': 'high',
-                'difficulty': 'medium',
-                'time_horizon': 'short',
-                'key_insight': 'Adoption depends on ecosystem integration'
-            },
-            {
-                'opportunity_type': 'product',
-                'title': 'Managed API Service',
-                'description': 'Offer hosted API with usage-based pricing',
-                'impact_potential': 'high',
-                'difficulty': 'medium',
-                'time_horizon': 'medium',
-                'key_insight': 'Monetization path for open models'
-            }
-        ])
-    elif tech_layer == 'ai_application':
-        opportunities.extend([
-            {
-                'opportunity_type': 'product',
-                'title': 'Enterprise Features',
-                'description': 'Add SSO, audit logs, team collaboration for B2B sales',
-                'impact_potential': 'medium',
-                'difficulty': 'low',
-                'time_horizon': 'short',
-                'key_insight': 'Open source often lacks enterprise polish'
-            },
-            {
-                'opportunity_type': 'business_model',
-                'title': 'Plugin Marketplace',
-                'description': 'Create marketplace for community extensions',
-                'impact_potential': 'medium',
-                'difficulty': 'high',
-                'time_horizon': 'long',
-                'key_insight': 'Network effects create sustainable moat'
-            }
-        ])
-    else:
-        opportunities.append({
-            'opportunity_type': 'tech',
-            'title': 'Performance Optimizations',
-            'description': 'Benchmark and optimize for production workloads',
-            'impact_potential': 'medium',
-            'difficulty': 'medium',
-            'time_horizon': 'short',
-            'key_insight': 'Production readiness differentiates from research code'
-        })
+    # Heuristic path provides classification only. Subjective narrative fields
+    # stay empty and no opportunities are fabricated (LLM path owns those).
 
     return {
         'tech_layer': tech_layer,
         'application': application,
-        'problem_solved': f"Addresses needs in {application} space",
-        'innovation_summary': 'Open source implementation with community contributions',
-        'differentiation': 'Open source alternative to proprietary solutions',
-        'market_timing': 'Growing demand for open AI tools',
+        'problem_solved': '',
+        'innovation_summary': '',
+        'differentiation': '',
+        'market_timing': '',
         'ecosystem_position': 'application_layer' if tech_layer == 'ai_application' else ('base_layer' if tech_layer in ('foundation_model', 'training_framework') else 'middleware'),
-        'commercialization_path': 'Offer hosted service or enterprise support based on open-source adoption',
+        'commercialization_path': '',
         'overall_score': min(10, max(1, 5 + int(float(((project.get('burst_signals') or {}).get('overall_score') or 0)) * 5))),
-        'opportunities': opportunities
+        'opportunities': []
     }
 
 
