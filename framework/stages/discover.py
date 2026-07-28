@@ -316,6 +316,95 @@ class DiscoverStage:
         """Sample current star count for velocity tracking."""
         self.db.sample_star_count(project_id, stars, conn=conn)
 
+    def _fetch_stargazer_timestamps(self, full_name: str, stars: int) -> List[str]:
+        """Fetch starred_at timestamps, newest first, bounded by backfill config."""
+        cfg = self.config.get_backfill_config()
+        max_pages = cfg['max_pages']
+        if stars <= 0:
+            return []
+        # GitHub stargazers endpoint only serves the first 400 pages (page>400 -> 422)
+        last_page = min((stars + 99) // 100, 400)
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=35)).date()
+        timestamps: List[str] = []
+        pages_fetched = 0
+        for page in range(last_page, 0, -1):
+            if pages_fetched >= max_pages:
+                break
+            try:
+                data = self._github_request(
+                    f"https://api.github.com/repos/{quote(full_name, safe='')}/stargazers",
+                    params={"per_page": 100, "page": page},
+                    headers={'Accept': 'application/vnd.github.star+json'},
+                )
+            except GitHubAPIError as e:
+                print(f"  Backfill page {page} failed for {full_name}: {e}")
+                break
+            pages_fetched += 1
+            if not isinstance(data, list):
+                break
+            page_earliest = None
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                ts = item.get('starred_at')
+                if not ts:
+                    continue
+                timestamps.append(ts)
+                try:
+                    d = datetime.fromisoformat(ts.replace('Z', '+00:00')).date()
+                except (ValueError, TypeError):
+                    continue
+                if page_earliest is None or d < page_earliest:
+                    page_earliest = d
+            # Stop when the whole page is older than the 35-day window
+            if page_earliest is not None and page_earliest < cutoff_date:
+                break
+        return timestamps
+
+    def _backfill_star_history(self, project_id: str, stars: int, conn=None) -> int:
+        """Rebuild daily star history from stargazer timestamps (first-seen projects).
+
+        Returns number of synthetic rows written. Skips entirely if the project
+        already has star_history rows. Synthetic rows use 'YYYY-MM-DD' dates to
+        match db.sample_star_count's date(?) format and UNIQUE(project_id, sampled_at).
+        """
+        should_close = conn is None
+        conn = conn or self.db.get_conn()
+        try:
+            existing = conn.execute(
+                'SELECT 1 FROM star_history WHERE project_id = ? LIMIT 1', (project_id,)
+            ).fetchone()
+            if existing:
+                return 0
+            timestamps = self._fetch_stargazer_timestamps(project_id, stars)
+            if not timestamps:
+                return 0
+            # Count stars per UTC date; accumulate oldest -> newest
+            per_day: Dict[str, int] = {}
+            for ts in timestamps:
+                day = ts[:10]
+                per_day[day] = per_day.get(day, 0) + 1
+            # Total stars covered by fetched timestamps; stars before the oldest
+            # fetched timestamp form the baseline so curves end at current count.
+            covered = len(timestamps)
+            baseline = max(stars - covered, 0)
+            written = 0
+            cumulative = baseline
+            for day in sorted(per_day):
+                cumulative += per_day[day]
+                conn.execute(
+                    'INSERT OR IGNORE INTO star_history (project_id, sampled_at, stars) VALUES (?, ?, ?)',
+                    (project_id, day, cumulative)
+                )
+                written += 1
+            if should_close:
+                conn.commit()
+            print(f"  Backfilled {written} days of star history for {project_id}")
+            return written
+        finally:
+            if should_close:
+                conn.close()
+
     def _calculate_and_store_burst_score(self, project_id: str, conn=None):
         """Calculate early-burst score from sampled data."""
         should_close = conn is None
