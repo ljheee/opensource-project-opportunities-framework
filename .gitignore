@@ -14,14 +14,8 @@
 # Test databases
 test_*.db*
 
-# Data artifacts (keep .gitkeep but ignore generated content)
-data/*.db
-!data/.gitkeep
-data/reports/*.md
-!data/reports/.gitkeep
-
-# Generated reports
-reports/
+# Generated reports (top-level only; data/reports/ is committed by the pipeline)
+/reports/
 
 # Python
 __pycache__/

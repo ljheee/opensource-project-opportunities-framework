@@ -161,11 +161,11 @@ def classify_project_heuristic(project: dict) -> tuple:
     return True, tech_layer, application, 'valid_ai_project'
 
 
-def run_filter(db: Database, dry_run: bool = False):
+def run_filter(db: Database, dry_run: bool = False, limit: int = 50):
     """Run the semantic filtering stage."""
     print("=== Stage 3: Semantic Filtering ===")
 
-    projects = get_discovered_projects(db)
+    projects = get_discovered_projects(db, limit=limit)
     if not projects:
         print("No projects to filter.")
         return 0
@@ -215,10 +215,16 @@ def main():
     parser = argparse.ArgumentParser(description="Semantic filtering for AI projects")
     parser.add_argument('--dry-run', action='store_true',
                         help="Don't write to database")
+    parser.add_argument('--limit', type=int, default=50,
+                        help="Max projects to classify per invocation")
     args = parser.parse_args()
 
+    if args.limit <= 0:
+        print("ERROR: limit must be a positive integer")
+        sys.exit(1)
+
     db = Database()
-    run_filter(db, dry_run=args.dry_run)
+    run_filter(db, dry_run=args.dry_run, limit=args.limit)
 
 
 if __name__ == '__main__':
