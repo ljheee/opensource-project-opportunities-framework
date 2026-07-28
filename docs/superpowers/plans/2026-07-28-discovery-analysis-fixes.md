@@ -330,7 +330,7 @@ Expected: FAIL — `AssertionError: method missing`
                 break
             try:
                 data = self._github_request(
-                    f"https://api.github.com/repos/{quote(full_name, safe='')}/stargazers",
+                    f"https://api.github.com/repos/{quote(full_name, safe='/')}/stargazers",
                     params={"per_page": 100, "page": page},
                     headers={'Accept': 'application/vnd.github.star+json'},
                 )
@@ -425,6 +425,9 @@ db = Database(':memory:') if False else Database('/tmp/backfill_test.db')
 db.init_tables()
 s = DiscoverStage(ConfigLoader(), db)
 conn = db.get_conn()
+# star_history 有 FK 到 projects 且 PRAGMA foreign_keys=ON，必须先插 projects 行
+conn.execute("INSERT OR IGNORE INTO projects (id, name, status) VALUES (?, ?, 'discovered')", (REPO, REPO))
+conn.commit()
 stars = s._github_request(f'https://api.github.com/repos/{REPO}').get('stargazers_count', 0)
 n = s._backfill_star_history(REPO, stars, conn=conn)
 rows = conn.execute(
@@ -589,7 +592,7 @@ git commit -m "feat: wire star-history backfill into ingest with daily budget an
         since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         try:
             commits = self._github_request(
-                f"https://api.github.com/repos/{quote(full_name, safe='')}/commits",
+                f"https://api.github.com/repos/{quote(full_name, safe='/')}/commits",
                 params={"since": since, "per_page": 100},
             )
         except GitHubAPIError as e:
@@ -1587,6 +1590,7 @@ Expected: 消耗量（before−after）符合 §2.5 预算（稳态 ~400-500，�
 - [ ] **V4**: `python3 framework/stages/validate.py --metrics-only` 与 `python3 framework/stages/reweight.py --dry-run` 均不崩
 - [ ] **V5**: 连续两天跑 `./run.sh`：确认 active 项目不再每天重复生成 incremental 任务（spec §4 验证项 8）
 - [ ] **V6（上线后 7 天观察项）**: 观察基于合成历史评分的项目 FP 表现（spec §4 验证项 9）：`sqlite3 data/framework.db "SELECT project_id, overall_score FROM early_burst_signals WHERE signals_json LIKE '%\"synthetic_history\": true%' ORDER BY calculated_at DESC LIMIT 20;"` —— 若这批项目后续集中被 validate 判为 false_positive，说明 unstar 低估偏差影响过大，需重新评估回溯策略
+- [ ] **V7（网络相关遗留项）**: 开发机所在网络对 `/repos/{}/stargazers` 端点返回 404（网关限制，commits/readme/search 均正常），Task 3 的 stargazers 真实链路 E2E 无法在本地完成。合并后首次 GitHub Actions 运行时，检查 workflow 日志中的 `Backfilled N days` 行确认回溯在 CI 网络下生效；若 CI 也失败，排查 endpoint 可用性并考虑 GraphQL 替代
 
 ## 执行前置条件
 
