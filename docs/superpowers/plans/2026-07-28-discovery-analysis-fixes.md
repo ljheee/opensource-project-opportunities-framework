@@ -254,7 +254,7 @@ discover.py:456 的 query 构造与 460 行的请求改为：
 - [ ] **Step 4: dry-run 验证（spec §4 验证项 1）**
 
 ```bash
-GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 framework/stages/discover.py --dry-run 2>&1 | head -30
+GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 framework/stages/discover.py --dry-run 2>&1 | head -30
 ```
 
 Expected: 正常列出项目无报错。再验证 cutoff 生效：
@@ -440,7 +440,7 @@ vals = [r['stars'] for r in rows]
 assert vals == sorted(vals), 'not monotonic'
 print('E2E OK:', n, 'days, latest =', vals[-1], '/ actual', stars)
 EOF
-PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 /tmp/verify_backfill_e2e.py owner/repo
+PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 /tmp/verify_backfill_e2e.py owner/repo
 ```
 
 Expected: 打印逐日曲线，`E2E OK`；最后一行 stars ≈ 实际值（允许小误差：回溯期间 star 变动 + unstar 单向低估，见 spec §2.2 已知偏差）。手动与 GitHub 页面 star 曲线形状比对。
@@ -542,7 +542,7 @@ cfg = yaml.safe_load(open('config.yaml'))
 cfg['sources']['github']['backfill_max_per_day'] = 2
 yaml.safe_dump(cfg, open('/tmp/config_test.yaml', 'w'), allow_unicode=True, sort_keys=False)
 EOF
-PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 -c "
+PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 -c "
 from framework.core.config_loader import ConfigLoader
 from framework.core.db import Database
 from framework.stages.discover import DiscoverStage
@@ -642,7 +642,7 @@ git commit -m "feat: wire star-history backfill into ingest with daily budget an
 - [ ] **Step 3: 验证**
 
 ```bash
-PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 -c "
+PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 -c "
 from framework.core.config_loader import ConfigLoader
 from framework.core.db import Database
 from framework.stages.discover import DiscoverStage
@@ -1089,7 +1089,7 @@ def _fetch_readme(project_id: str) -> str:
 - [ ] **Step 3: 重跑 Step 1 验证 + 清洗验证**
 
 ```bash
-PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 -c "
+PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 -c "
 from framework.stages.analyze import _fetch_readme, _sanitize_readme
 dirty = '![x](data:image/png;base64,AAAA) <img src=\"data:image/png;base64,BBBB\"> [![b](https://img.shields.io/x)](https://y) real content'
 clean = _sanitize_readme(dirty)
@@ -1576,7 +1576,7 @@ git commit -m "fix: abort on code changes in run scripts, loop filter with --lim
 - [ ] **V2**: 运行前后实测速率消耗（spec §4 验证项 3 + §2.5 预算）：
 
 ```bash
-TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2)
+TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"')
 curl -s -H "Authorization: Bearer $TOKEN" https://api.github.com/rate_limit | python3 -c "import json,sys; r=json.load(sys.stdin)['resources']['core']; print('before:', r['remaining'])"
 ./run.sh   # 或单独 python3 framework/stages/discover.py
 curl -s -H "Authorization: Bearer $TOKEN" https://api.github.com/rate_limit | python3 -c "import json,sys; r=json.load(sys.stdin)['resources']['core']; print('after:', r['remaining'])"
