@@ -89,7 +89,7 @@ init_db.py  ->  discover.py  ->  filter.py  ->  schedule.py  ->  analyze.py  -> 
    - GitHub Trending HTML parsing.
    It upserts projects, samples star counts, and computes early-burst signals.
 3. **filter.py**: Heuristic semantic filter that classifies `discovered` projects into `tech_layer`/`application` and marks them as `scheduled` or `filtered_skip`.
-4. **schedule.py**: Creates analysis tasks of type `bulk` or `incremental`, prioritizing by early-burst score.
+4. **schedule.py**: Creates analysis tasks of type `bulk` or `incremental`, prioritizing by early-burst score. Incremental change triggers only see projects still surfaced by discovery — projects that drop out of all discovery sources stop accumulating fresh stars/`last_commit_at` and will not be re-analyzed (known limitation, follow-up).
 5. **analyze.py**: Picks pending tasks, optionally calls an LLM CLI tool via `framework/prompts/ai_analyze.md`, and stores `analyses` and `opportunities`. Falls back to a heuristic analyzer when LLM is unavailable.
 6. **report.py**: Generates a daily Markdown report in `data/reports/YYYY-MM-DD.md` with global stats, tech-stack distribution, top opportunities, and early-burst project listings.
 

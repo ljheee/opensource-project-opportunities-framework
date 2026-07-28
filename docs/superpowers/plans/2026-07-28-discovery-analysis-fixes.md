@@ -807,8 +807,9 @@ def _fn_threshold() -> float:
         for row in fn_cur.fetchall():
             baseline = conn.execute('''
                 SELECT stars FROM star_history
-                WHERE project_id = ? ORDER BY sampled_at ASC LIMIT 1
-            ''', (row['project_id'],)).fetchone()
+                WHERE project_id = ? AND sampled_at <= date(?)
+                ORDER BY sampled_at DESC LIMIT 1
+            ''', (row['project_id'], row['first_seen_at'])).fetchone()
             baseline_stars = baseline['stars'] if baseline else row['stars']
             # 无星史样本时基线是当前 stars，checked_at 记首次发现日（spec §2.4-2）
             if baseline:

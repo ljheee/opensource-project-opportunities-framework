@@ -97,7 +97,7 @@ Review 发现当前实现存在两类核心缺陷：
 **完整算法**（review 指出原表述不可实现，本节为实现级定义）：
 
 1. **候选**：`source='trending'`、最新信号 `is_early_burst=0`、无 prediction_outcomes 行、距首次发现 ≥ `min_days` 的项目
-2. **记录**：写入 prediction_outcomes 行，`overall_score_at_prediction` 写实际 score（**必然 < min_score**，以此与 TP 候选行区分，免 schema 变更）；`stars_at_prediction` 取 star_history 最早可用样本（无样本则取 projects.stars 当前值并记 checked_at 为首次发现日）；`growth_rate_predicted` 写固定阈值
+2. **记录**：写入 prediction_outcomes 行，`overall_score_at_prediction` 写实际 score（**必然 < min_score**，以此与 TP 候选行区分，免 schema 变更）；`stars_at_prediction` 取 first_seen_at 当日或之前最近的 star_history 样本（原因：回溯合成的历史可能远早于 first_seen，用最早样本会把预测前增长计入预测后增速；无样本则取 projects.stars 当前值并记 checked_at 为首次发现日）；`growth_rate_predicted` 写固定阈值
 3. **FN 判定阈值**：固定值 = `min_score × 8 × 0.5`（与 TP 判定公式同源，当前 = 2.6 stars/day）。冷启动不依赖任何 TP 数据
 4. **check 分支**：`check_pending_outcomes` 按 `overall_score_at_prediction >= min_score` 区分方向——
    - TP 候选：现有逻辑不变（actual ≥ predicted×0.5 → true_positive，否则 false_positive）
