@@ -296,7 +296,8 @@ def validate_opportunity(opp: Dict) -> Tuple[bool, str]:
     return True, ""
 
 
-def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Dict, conn=None) -> int:
+def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Dict, conn=None,
+                                     analyzer_version: str = 'llm-v1') -> int:
     """Store analysis results and opportunities atomically."""
     should_close = conn is None
     conn = conn or db.get_conn()
@@ -324,7 +325,7 @@ def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Di
             analysis.get('ecosystem_position') or '',
             analysis.get('commercialization_path') or '',
             analysis.get('overall_score', 5),
-            'v1.0'
+            analyzer_version
         ))
 
         # Store opportunities
@@ -609,6 +610,7 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
         'star_trajectory': star_trajectory,
         'peer_comparison': peer_comparison,
         'inflection_analysis': inflection_analysis,
+        'readme_excerpt': project.get('readme') or '_README unavailable._',
     })
 
     try:
@@ -861,16 +863,19 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
             # Generate analysis
             if use_llm and cli_tool:
                 analysis = generate_analysis_with_llm(project, cli_tool, resilience_config)
+                analyzer_version = 'llm-v1'
             else:
                 analysis = None
+                analyzer_version = 'llm-v1'
 
             if not analysis:
                 print(f"  Using heuristic analysis (LLM unavailable)")
                 analysis = generate_heuristic_analysis(project)
+                analyzer_version = 'heuristic-v1'
 
             # Store analysis and opportunities atomically (shared conn)
             opportunities_count = store_analysis_and_opportunities(
-                db, project_id, analysis, conn=conn
+                db, project_id, analysis, conn=conn, analyzer_version=analyzer_version
             )
 
             # Mark task complete and project as active (same transaction)
