@@ -126,6 +126,9 @@ class DiscoverStage:
                     time.sleep(min(retry_after, retry_delay))
                     continue
 
+                if response.status_code == 404:
+                    raise GitHubAPIError(f"Not found: {url}", status_code=404)
+
                 response.raise_for_status()
                 try:
                     return response.json()
@@ -332,7 +335,7 @@ class DiscoverStage:
                 break
             try:
                 data = self._github_request(
-                    f"https://api.github.com/repos/{quote(full_name, safe='')}/stargazers",
+                    f"https://api.github.com/repos/{quote(full_name, safe='/')}/stargazers",
                     params={"per_page": 100, "page": page},
                     headers={'Accept': 'application/vnd.github.star+json'},
                 )
