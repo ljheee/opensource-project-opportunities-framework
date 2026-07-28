@@ -59,6 +59,7 @@ class DiscoverStage:
         self.resilience = config.get_resilience_config()
         self.star_min, self.star_max = config.get_star_range()
         self.created_within_days = config.get_created_within_days()
+        self._backfills_done = 0
 
     def _github_request(self, url: str, params: Optional[Dict] = None,
                        is_search: bool = False, headers: Optional[Dict] = None) -> Dict:
@@ -408,6 +409,16 @@ class DiscoverStage:
             if should_close:
                 conn.close()
 
+    def _backfill_within_budget(self, project_id: str, stars: int, conn) -> int:
+        """Backfill one project if the daily budget allows. Returns rows written."""
+        budget = self.config.get_backfill_config()['max_per_day']
+        if self._backfills_done >= budget:
+            return 0
+        written = self._backfill_star_history(project_id, stars, conn=conn)
+        if written > 0:
+            self._backfills_done += 1
+        return written
+
     def _calculate_and_store_burst_score(self, project_id: str, conn=None):
         """Calculate early-burst score from sampled data."""
         should_close = conn is None
@@ -525,7 +536,11 @@ class DiscoverStage:
                     'stars_14d_ago': stars_14d_ago,
                     'stars_21d_ago': stars_21d_ago,
                     'stars_30d_ago': stars_30d_ago,
-                    'current_stars': current_stars
+                    'current_stars': current_stars,
+                    'synthetic_history': bool(
+                        history and proj['first_seen_at']
+                        and min(h['sampled_at'] for h in history) < str(proj['first_seen_at'])[:10]
+                    ),
                 })
             ))
             if should_close:
@@ -772,9 +787,11 @@ class DiscoverStage:
                         conn=conn
                     )
                     stored_count += 1
+                    new_stars = (item.get('repo') or {}).get('stargazers_count') or 0
+                    self._backfill_within_budget(project_id, new_stars, conn=conn)
                     self._sample_star_count(
                         project_id,
-                        (item.get('repo') or {}).get('stargazers_count') or 0,
+                        new_stars,
                         conn=conn
                     )
                     self._calculate_and_store_burst_score(project_id, conn=conn)
@@ -802,6 +819,7 @@ class DiscoverStage:
                         proj_stars = int(proj['stars']) if proj['stars'] is not None else 0
                     except (ValueError, TypeError):
                         proj_stars = 0
+                    self._backfill_within_budget(proj['id'], proj_stars, conn=conn)
                     self._sample_star_count(proj['id'], proj_stars, conn=conn)
                     self._calculate_and_store_burst_score(proj['id'], conn=conn)
                     sampled += 1
