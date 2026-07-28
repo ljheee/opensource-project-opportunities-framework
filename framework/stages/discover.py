@@ -58,10 +58,15 @@ class DiscoverStage:
         self.scoring = ScoringEngine(config.get_early_burst_config())
         self.resilience = config.get_resilience_config()
         self.star_min, self.star_max = config.get_star_range()
+        self.created_within_days = config.get_created_within_days()
 
     def _github_request(self, url: str, params: Optional[Dict] = None,
-                       is_search: bool = False) -> Dict:
-        """Make GitHub API request with rate limit handling."""
+                       is_search: bool = False, headers: Optional[Dict] = None) -> Dict:
+        """Make GitHub API request with rate limit handling.
+
+        headers: optional override/merge into the default HEADERS
+        (e.g. stargazers endpoints need Accept: application/vnd.github.star+json).
+        """
         global _last_request_time
 
         # Rate limiting for search API
@@ -88,9 +93,10 @@ class DiscoverStage:
 
         for attempt in range(max_retries):
             try:
+                req_headers = {**HEADERS, **headers} if headers else HEADERS
                 response = requests.get(
                     url,
-                    headers=HEADERS,
+                    headers=req_headers,
                     params=params,
                     timeout=30
                 )
@@ -453,11 +459,12 @@ class DiscoverStage:
                 # Quote topic/lang if they contain spaces for valid GitHub search syntax
                 safe_topic = f'"{topic}"' if ' ' in topic else topic
                 safe_lang = f'"{lang}"' if ' ' in lang else lang
-                query = f"topic:{safe_topic} language:{safe_lang} stars:{self.star_min}..{self.star_max}"
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=self.created_within_days)).strftime('%Y-%m-%d')
+                query = f"topic:{safe_topic} language:{safe_lang} stars:{self.star_min}..{self.star_max} created:>{cutoff}"
                 url = "https://api.github.com/search/repositories"
 
                 try:
-                    data = self._github_request(url, {"q": query, "sort": "stars", "per_page": 30}, is_search=True)
+                    data = self._github_request(url, {"q": query, "sort": "updated", "per_page": 30}, is_search=True)
 
                     if not isinstance(data, dict):
                         print(f"  Unexpected search response type: {type(data)}")
