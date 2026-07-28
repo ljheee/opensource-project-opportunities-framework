@@ -1431,7 +1431,9 @@ sch = Scheduler(db.db_path, {'incremental': {'star_change_threshold': 0.05, 'rec
 n = sch.generate_incremental_tasks('2099-01-01', 10)
 assert n == 2, f'expected 2 tasks, got {n}'
 conn = db.get_conn()
-ids = {r['project_id'] for r in conn.execute("SELECT project_id FROM tasks").fetchall()}
+ids = {r['project_id'] for r in conn.execute(
+    "SELECT project_id FROM tasks WHERE status='pending' AND task_date='2099-01-01'"
+).fetchall()}
 assert ids == {'a/growth', 'a/commit'}, ids
 print('trigger rules OK:', ids)
 EOF
