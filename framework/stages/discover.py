@@ -425,6 +425,32 @@ class DiscoverStage:
             self._backfills_done += 1
         return written
 
+    def _fetch_weekly_contributors(self, full_name: str) -> Optional[int]:
+        """Count distinct commit authors in the last 7 days. None on failure."""
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        try:
+            commits = self._github_request(
+                f"https://api.github.com/repos/{quote(full_name, safe='/')}/commits",
+                params={"since": since, "per_page": 100},
+            )
+        except GitHubAPIError as e:
+            print(f"  Contributors fetch failed for {full_name}: {e}")
+            return None
+        if not isinstance(commits, list):
+            return None
+        authors = set()
+        for c in commits:
+            if not isinstance(c, dict):
+                continue
+            login = ((c.get('author') or {}) or {}).get('login')
+            if login:
+                authors.add(login.lower())
+                continue
+            email = (((c.get('commit') or {}).get('author') or {}) or {}).get('email')
+            if email:
+                authors.add(str(email).lower())
+        return len(authors)
+
     def _calculate_and_store_burst_score(self, project_id: str, conn=None):
         """Calculate early-burst score from sampled data."""
         should_close = conn is None
@@ -511,8 +537,18 @@ class DiscoverStage:
             activity_score = self.scoring.calculate_activity_index(
                 open_issues, commit_frequency
             )
+            contributor_count = proj['contributor_count']
+            if contributor_count is None:
+                fetched = self._fetch_weekly_contributors(project_id)
+                if fetched is not None:
+                    contributor_count = fetched
+                    conn.execute(
+                        'UPDATE projects SET contributor_count = ? WHERE id = ?',
+                        (fetched, project_id)
+                    )
             novelty_score = self.scoring.calculate_novelty(
-                proj['first_commit_at'] or proj['created_at'], 1
+                proj['first_commit_at'] or proj['created_at'],
+                contributor_count if contributor_count is not None else 1
             )
             buzz_score = self.scoring.default_buzz_score()
 
