@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import requests
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 
@@ -25,6 +26,42 @@ VALID_OPPORTUNITY_TYPES = {'product', 'tech', 'market', 'integration', 'business
 VALID_IMPACT_LEVELS = {'high', 'medium', 'low'}
 VALID_DIFFICULTY_LEVELS = {'high', 'medium', 'low'}
 VALID_TIME_HORIZONS = {'short', 'medium', 'long'}
+
+_GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
+_README_HEADERS = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+if _GITHUB_TOKEN:
+    _README_HEADERS['Authorization'] = f'Bearer {_GITHUB_TOKEN}'
+
+_README_MAX_CHARS = 10000
+_DATA_URI_RE = re.compile(r'!\[[^\]]*\]\(\s*data:[^)]*\)', re.IGNORECASE)
+_IMG_TAG_RE = re.compile(r'<(img|picture|source)[^>]*>.*?</\1>|<(img|source)[^>]*/?>', re.IGNORECASE | re.DOTALL)
+_BADGE_RE = re.compile(r'\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)')
+
+
+def _sanitize_readme(text: str) -> str:
+    """Strip base64 data URIs, img/picture tags, and badge links before truncation."""
+    text = _DATA_URI_RE.sub('', text)
+    text = _IMG_TAG_RE.sub('', text)
+    text = _BADGE_RE.sub('', text)
+    return text[:_README_MAX_CHARS]
+
+
+def _fetch_readme(project_id: str) -> str:
+    """Fetch and sanitize a repo's README. Returns '' on any failure."""
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{project_id}/readme",
+            headers=_README_HEADERS, timeout=30
+        )
+        if r.status_code != 200:
+            print(f"  README fetch failed for {project_id}: HTTP {r.status_code}")
+            return ''
+        import base64
+        raw = base64.b64decode(r.json().get('content') or '')
+        return _sanitize_readme(raw.decode('utf-8', errors='replace'))
+    except Exception as e:
+        print(f"  README fetch error for {project_id}: {e}")
+        return ''
 
 
 def _is_whole_word(text: str, pattern: str) -> bool:
@@ -196,6 +233,8 @@ def get_project_data(db: Database, project_id: str, conn=None) -> Optional[Dict]
             limit=5,
             conn=conn
         )
+
+        proj_dict['readme'] = _fetch_readme(project_id)
 
         # Calculate peer percentile
         proj_dict['peer_percentile'] = _calculate_peer_percentile(
