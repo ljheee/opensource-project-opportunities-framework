@@ -148,6 +148,45 @@ print('weights OK:', round(r['overall_score'], 3))
 
 Expected: 输出 `weights OK: 0.705`
 
+- [ ] **Step 5b: 新旧权重翻转对比（spec §4 验证项 4）**
+
+```bash
+PYTHONPATH=. python3 - <<'EOF'
+from framework.core.config_loader import ConfigLoader
+from framework.core.db import Database
+from framework.core.scoring_engine import ScoringEngine
+
+db = Database()
+conn = db.get_conn()
+rows = conn.execute('''
+    SELECT project_id, star_velocity_score, activity_index_score,
+           community_buzz_score, novelty_score, overall_score, is_early_burst
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY calculated_at DESC) rn
+        FROM early_burst_signals
+    ) WHERE rn = 1
+''').fetchall()
+new_se = ScoringEngine(ConfigLoader().get_early_burst_config())
+OLD_W = {'v': 0.35, 'a': 0.25, 'b': 0.25, 'n': 0.15}
+flips = []
+for r in rows:
+    old_score = (r['star_velocity_score']*OLD_W['v'] + r['activity_index_score']*OLD_W['a']
+                 + r['community_buzz_score']*OLD_W['b'] + r['novelty_score']*OLD_W['n'])
+    new = new_se.calculate_overall(r['star_velocity_score'], r['activity_index_score'],
+                                   r['community_buzz_score'], r['novelty_score'])
+    old_burst = old_score >= 0.65
+    if old_burst != new['is_early_burst']:
+        flips.append((r['project_id'], round(old_score,3), round(new['overall_score'],3), old_burst))
+print(f'{len(rows)} projects, {len(flips)} flips')
+for f in flips[:20]:
+    print(' ', f)
+assert len(flips) <= max(2, len(rows) // 10), '翻转比例异常，检查权重配置'
+print('weight migration OK')
+EOF
+```
+
+Expected: 打印翻转名单（当前库 0 个 early-burst，预期翻转很少），输出 `weight migration OK`
+
 - [ ] **Step 6: Commit**
 
 ```bash
@@ -281,7 +320,8 @@ Expected: FAIL — `AssertionError: method missing`
         max_pages = cfg['max_pages']
         if stars <= 0:
             return []
-        last_page = (stars + 99) // 100
+        # GitHub stargazers endpoint only serves the first 400 pages (page>400 -> 422)
+        last_page = min((stars + 99) // 100, 400)
         cutoff_date = (datetime.now(timezone.utc) - timedelta(days=35)).date()
         timestamps: List[str] = []
         pages_fetched = 0
@@ -506,7 +546,7 @@ PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 -c "
 from framework.core.config_loader import ConfigLoader
 from framework.core.db import Database
 from framework.stages.discover import DiscoverStage
-s = DiscoverStage(ConfigLoader(), Database())
+s = DiscoverStage(ConfigLoader('/tmp/config_test.yaml'), Database())
 # 直接驱动预算守卫：挑 3 个无历史项目
 conn = s.db.get_conn()
 rows = conn.execute('''SELECT p.id, p.stars FROM projects p
@@ -719,6 +759,8 @@ git commit -m "fix: drop community_buzz from reweight components, make backtest 
 validate.py 的 import 区（第 14 行 `from framework.core.db import Database` 后）追加：
 
 ```python
+from datetime import datetime, timezone
+
 from framework.core.config_loader import ConfigLoader
 
 
@@ -729,14 +771,9 @@ def _fn_threshold() -> float:
     except Exception:
         min_score = 0.65
     return min_score * 8 * 0.5
-
-
-def _min_score() -> float:
-    try:
-        return ConfigLoader().get_early_burst_config().min_score
-    except Exception:
-        return 0.65
 ```
+
+注意：**方向判定不读 min_score**——FN 候选行在记录时组件列全 NULL，check 时用 `star_velocity_at_pred IS NULL` 判方向（见 Step 3），这样 reweight 未来调整 min_score 不会重分类存量 pending 行。
 
 - [ ] **Step 2: `record_new_predictions` 增加 FN 候选记录**
 
@@ -770,6 +807,11 @@ def _min_score() -> float:
                 WHERE project_id = ? ORDER BY sampled_at ASC LIMIT 1
             ''', (row['project_id'],)).fetchone()
             baseline_stars = baseline['stars'] if baseline else row['stars']
+            # 无星史样本时基线是当前 stars，checked_at 记首次发现日（spec §2.4-2）
+            if baseline:
+                checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            else:
+                checked_at = str(row['first_seen_at'])[:10]
             conn.execute('''
                 INSERT INTO prediction_outcomes
                 (project_id, predicted_at, stars_at_prediction,
@@ -778,10 +820,10 @@ def _min_score() -> float:
                  community_buzz_at_pred, novelty_at_pred,
                  growth_rate_predicted,
                  checked_at, outcome)
-                VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, date('now'), 'pending')
+                VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 'pending')
             ''', (row['project_id'], row['first_seen_at'],
                   baseline_stars, row['overall_score'],
-                  fn_threshold))
+                  fn_threshold, checked_at))
             fn_recorded += 1
         print(f"Recorded {fn_recorded} new FN candidates")
 ```
@@ -797,14 +839,22 @@ def _min_score() -> float:
 
 - [ ] **Step 3: `check_pending_outcomes` 加方向分支**
 
-validate.py:96-141 的行内处理循环中，把判定段（现有 124-130 行的 TP/FP 判定）替换为：
+先给现有 SELECT（validate.py:83-93）加一列——方向判定需要它：
+
+```sql
+            SELECT po.id, po.project_id, po.stars_at_prediction,
+                   po.overall_score_at_prediction, po.predicted_at,
+                   po.growth_rate_predicted, po.star_velocity_at_pred,
+                   p.stars as stars_now,
+```
+
+然后 validate.py:96-141 的行内处理循环中，把判定段（现有 124-130 行的 TP/FP 判定）替换为：
 
 ```python
-            is_tp_candidate = False
-            try:
-                is_tp_candidate = float(row['overall_score_at_prediction']) >= _min_score()
-            except (ValueError, TypeError):
-                is_tp_candidate = True
+            # 方向在记录时已固化：FN 候选行的组件列全为 NULL（Step 2 插入的）。
+            # 不要用 score vs 当前 min_score 重判——reweight 可能已调整阈值，
+            # 会把存量 TP 候选行错误重分类。
+            is_tp_candidate = row['star_velocity_at_pred'] is not None
 
             if is_tp_candidate:
                 # 原有 TP 候选逻辑（保持不变）
@@ -915,9 +965,21 @@ report.py:88 的 `fp_count` 计数块之后追加：
                 tn_count = 0
 ```
 
-- [ ] **Step 2: 输出区追加 recall**
+- [ ] **Step 2: 输出区追加 recall（注意渲染条件）**
 
-report.py:177（`avg_pred_fp` 输出行）之后追加：
+report.py:144 的渲染分支条件必须放宽——`total_evaluated` 只统计 TP/FP，FN 可能先于任何 TP/FP 成熟，不能藏在分支里。把：
+
+```python
+            if total_evaluated > 0:
+```
+
+改为：
+
+```python
+            if total_evaluated > 0 or (fn_count + tn_count) > 0:
+```
+
+并在该分支内 `avg_pred_fp` 输出行（report.py:177）之后追加：
 
 ```python
                 lines.append(f"- **Missed bursts (FN):** {fn_count} | **Correctly passed (TN):** {tn_count}")
@@ -925,6 +987,8 @@ report.py:177（`avg_pred_fp` 输出行）之后追加：
                     recall = tp_count / (tp_count + fn_count)
                     lines.append(f"- **Recall (trending-source):** {recall:.1%}")
 ```
+
+（分支内其余语句均只依赖 total_evaluated，为 0 时跳过 precision 段不受影响——precision 段本身在 `if total_evaluated > 0` 语义下输出，保持原样即可；若 total_evaluated 为 0 时进入分支，precision 相关行会输出除零——因此需把 precision 四行（report.py:174-177）包在 `if total_evaluated > 0:` 内层判断里，FN/TN 行放在内层判断之外。）
 
 - [ ] **Step 3: 验证**
 
@@ -1218,13 +1282,18 @@ git commit -m "fix: heuristic analysis no longer fabricates opportunities or nar
 
 ```bash
 PYTHONPATH=. python3 - <<'EOF'
+from datetime import datetime, timezone, timedelta
 from framework.core.db import Database
 from framework.core.scheduler import Scheduler
+
+iso = lambda days_ago: (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
 db = Database('/tmp/sched_test.db'); db.init_tables()
 conn = db.get_conn()
-# active 项目：昨天刚分析过，涨幅巨大 —— 冷静期内，不应生成任务
-conn.execute("INSERT INTO projects (id, name, stars, status, last_commit_at) VALUES ('a/x','x',1000,'active', datetime('now'))")
-conn.execute("INSERT INTO analyses (project_id, analyzed_at, overall_score) VALUES ('a/x', datetime('now','-1 day'), 8)")
+# active 项目：昨天刚分析过（有 done task + analyses 行，时间用生产同款 ISO 格式），
+# 涨幅巨大 —— 冷静期内，不应生成任务
+conn.execute("INSERT INTO projects (id, name, stars, status, last_commit_at) VALUES ('a/x','x',1000,'active', ?)", (iso(0),))
+conn.execute("INSERT INTO analyses (project_id, analyzed_at, overall_score) VALUES ('a/x', ?, 8)", (iso(1),))
+conn.execute("INSERT INTO tasks (project_id, task_date, task_type, status) VALUES ('a/x', '2026-01-01', 'incremental', 'done')")
 conn.execute("INSERT INTO star_history (project_id, sampled_at, stars) VALUES ('a/x', date('now','-7 days'), 100)")
 conn.commit(); conn.close()
 sch = Scheduler(db.db_path, {'incremental': {'star_change_threshold': 0.05, 'recent_commit_days': 3, 'min_reanalyze_days': 7}})
@@ -1234,7 +1303,7 @@ print('cooldown OK')
 EOF
 ```
 
-Expected: FAIL — 当前实现无条件生成 1 个任务
+Expected: FAIL — 当前实现无条件生成 1 个任务。**注意**：fixture 必须插 done task（否则按新 SQL 落入"从未分析放行"分支），且时间值必须用生产同款 `isoformat()`（含 'T' 和时区），否则测不出 datetime 格式比较问题。
 
 - [ ] **Step 2: `generate_incremental_tasks` 查询重写**
 
@@ -1284,9 +1353,12 @@ scheduler.py:74-120 的方法体中，读取配置并替换候选 SQL：
                     -- Never analyzed: always eligible
                     NOT EXISTS (SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.status = 'done')
                     OR (
-                        -- Cooldown elapsed since last analysis
-                        (
-                            SELECT MAX(a.analyzed_at) FROM analyses a WHERE a.project_id = p.id
+                        -- Cooldown elapsed since last analysis.
+                        -- datetime() normalizes ISO 'T...+00:00' to SQLite 'YYYY-MM-DD HH:MM:SS';
+                        -- COALESCE prevents starvation when a done task exists but analyses rows are gone.
+                        COALESCE(
+                            datetime((SELECT MAX(a.analyzed_at) FROM analyses a WHERE a.project_id = p.id)),
+                            '1970-01-01'
                         ) <= datetime('now', '-' || ? || ' days')
                         AND (
                             -- 7-day star growth >= threshold (unknown history -> not satisfied)
@@ -1301,7 +1373,7 @@ scheduler.py:74-120 的方法体中，读取配置并替换候选 SQL：
                                     ORDER BY sampled_at DESC LIMIT 1
                                 ) h
                             ) >= ?
-                            OR p.last_commit_at >= datetime('now', '-' || ? || ' days')
+                            OR datetime(p.last_commit_at) >= datetime('now', '-' || ? || ' days')
                         )
                     )
                 )
@@ -1328,21 +1400,28 @@ Expected: 输出 `21:    scheduler = Scheduler(db.db_path, config.get_scheduling
 
 ```bash
 PYTHONPATH=. python3 - <<'EOF'
+from datetime import datetime, timezone, timedelta
 from framework.core.db import Database
 from framework.core.scheduler import Scheduler
+
+iso = lambda days_ago: (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
 db = Database('/tmp/sched_test2.db'); db.init_tables()
 conn = db.get_conn()
+# 每个项目都插 done task + analyses 行（ISO 格式），避免落入"从未分析放行"分支
 # 案例A：active、10 天前分析、7 日涨幅 50% -> 应放行
-conn.execute("INSERT INTO projects (id, name, stars, status, last_commit_at) VALUES ('a/growth','g',150,'active', datetime('now','-10 days'))")
-conn.execute("INSERT INTO analyses (project_id, analyzed_at, overall_score) VALUES ('a/growth', datetime('now','-10 days'), 7)")
+conn.execute("INSERT INTO projects (id, name, stars, status, last_commit_at) VALUES ('a/growth','g',150,'active', ?)", (iso(10),))
+conn.execute("INSERT INTO analyses (project_id, analyzed_at, overall_score) VALUES ('a/growth', ?, 7)", (iso(10),))
+conn.execute("INSERT INTO tasks (project_id, task_date, task_type, status) VALUES ('a/growth', '2026-01-01', 'incremental', 'done')")
 conn.execute("INSERT INTO star_history (project_id, sampled_at, stars) VALUES ('a/growth', date('now','-7 days'), 100)")
 # 案例B：active、10 天前分析、无涨幅但昨天有 commit -> 应放行
-conn.execute("INSERT INTO projects (id, name, stars, status, last_commit_at) VALUES ('a/commit','c',100,'active', datetime('now','-1 day'))")
-conn.execute("INSERT INTO analyses (project_id, analyzed_at, overall_score) VALUES ('a/commit', datetime('now','-10 days'), 7)")
+conn.execute("INSERT INTO projects (id, name, stars, status, last_commit_at) VALUES ('a/commit','c',100,'active', ?)", (iso(1),))
+conn.execute("INSERT INTO analyses (project_id, analyzed_at, overall_score) VALUES ('a/commit', ?, 7)", (iso(10),))
+conn.execute("INSERT INTO tasks (project_id, task_date, task_type, status) VALUES ('a/commit', '2026-01-01', 'incremental', 'done')")
 conn.execute("INSERT INTO star_history (project_id, sampled_at, stars) VALUES ('a/commit', date('now','-7 days'), 100)")
 # 案例C：active、10 天前分析、无涨幅无新 commit -> 应抑制
-conn.execute("INSERT INTO projects (id, name, stars, status, last_commit_at) VALUES ('a/quiet','q',100,'active', datetime('now','-10 days'))")
-conn.execute("INSERT INTO analyses (project_id, analyzed_at, overall_score) VALUES ('a/quiet', datetime('now','-10 days'), 7)")
+conn.execute("INSERT INTO projects (id, name, stars, status, last_commit_at) VALUES ('a/quiet','q',100,'active', ?)", (iso(10),))
+conn.execute("INSERT INTO analyses (project_id, analyzed_at, overall_score) VALUES ('a/quiet', ?, 7)", (iso(10),))
+conn.execute("INSERT INTO tasks (project_id, task_date, task_type, status) VALUES ('a/quiet', '2026-01-01', 'incremental', 'done')")
 conn.execute("INSERT INTO star_history (project_id, sampled_at, stars) VALUES ('a/quiet', date('now','-7 days'), 100)")
 conn.commit(); conn.close()
 sch = Scheduler(db.db_path, {'incremental': {'star_change_threshold': 0.05, 'recent_commit_days': 3, 'min_reanalyze_days': 7}})
@@ -1432,13 +1511,15 @@ if [ -n "$_LOCAL_CHANGES" ]; then
   fi
   echo "WARN: Uncommitted data/ changes detected (likely from a previous failed push). Discarding:"
   echo "$_LOCAL_CHANGES" | sed 's/^/  /'
-  git -C "$FRAMEWORK_DIR" checkout -- data/ 2>/dev/null || true
+  # checkout HEAD -- 同时清理 staged 与工作区（崩溃在 git add 之后 commit 之前时，
+  # data/ 改动处于 staged 状态，单纯 checkout -- 清不掉 index，会导致 pull --rebase 失败）
+  git -C "$FRAMEWORK_DIR" checkout HEAD -- data/ 2>/dev/null || true
 fi
 git -C "$FRAMEWORK_DIR" pull --rebase || \
   echo "WARN: git pull --rebase failed, continuing with local state (may be missing remote changes)."
 ```
 
-（注意：删掉原有的 `git reset HEAD` + 全量 `git checkout -- .` 两行。）
+（注意：删掉原有的 `git reset HEAD` + 全量 `git checkout -- .` 两行；`checkout HEAD -- data/` 已覆盖 staged 清理，无需保留 reset。）
 
 - [ ] **Step 4: 两个脚本的 filter 调用改循环**
 
@@ -1455,16 +1536,30 @@ run.sh:59-64 与 run_bulk.sh:64-66 的单次 filter 调用替换为循环（上�
 
 （每轮 --limit 100 即 max_per_day，2 轮封顶 200/天，防死循环；backlog 巨大时多日消化。）
 
-- [ ] **Step 5: 验证（spec §4 验证项 10）**
+- [ ] **Step 5: 验证（spec §4 验证项 10，两场景真实执行）**
 
 ```bash
-# 场景1：仅 data/ 改动 -> 应继续
-touch data/framework.db && bash -n run.sh && echo "syntax OK"
-# 场景2：含代码改动 -> 应 exit 1（当前工作区恰好有未提交代码改动，可直接验证逻辑）
-git diff --name-only HEAD | grep -v '^data/' | head -3
+bash -n run.sh && bash -n run_bulk.sh && echo "syntax OK"
+
+# 场景1：含代码改动 -> 必须在 [0/6] 处 exit 1
+# （制造一个临时代码改动）
+echo "# tmp" >> framework/__init__.py
+./run.sh 2>&1 | head -8; echo "exit=${PIPESTATUS[0]:-$?}"
+git checkout -- framework/__init__.py
+
+# 场景2：仅 data/ 改动（含 staged）-> 应 WARN 后继续（不 exit 1）
+touch data/tmp_probe.txt
+git add data/tmp_probe.txt 2>/dev/null || true
+git rm --cached data/tmp_probe.txt -q 2>/dev/null; rm -f data/tmp_probe.txt
+# 用已跟踪的 data/reports 文件模拟 staged 改动
+echo "probe" >> data/reports/2026-04-22.md && git add data/reports/2026-04-22.md
+timeout 30 ./run.sh 2>&1 | head -6; echo "exit=$?"
+# 确认 staged 探测改动已被 checkout HEAD 清除
+git diff --cached --name-only | grep -q "data/reports/2026-04-22.md" && echo "FAIL: staged 未清理" || echo "staged cleanup OK"
+git checkout HEAD -- data/reports/2026-04-22.md 2>/dev/null || true
 ```
 
-Expected: `syntax OK`；grep 有输出（当前确有未提交代码改动——**执行本计划前应先 commit 这些改动，见下方"执行前置条件"**）
+Expected: `syntax OK`；场景1 输出 `ERROR: Uncommitted code/config changes detected` 且 exit=1；场景2 输出 `WARN: Uncommitted data/ changes` 且不 exit 1（30s timeout 会截断后续 pipeline，属预期）；`staged cleanup OK`
 
 - [ ] **Step 6: Commit**
 
@@ -1478,7 +1573,16 @@ git commit -m "fix: abort on code changes in run scripts, loop filter with --lim
 ## 最终全链路验证（spec §4）
 
 - [ ] **V1**: `./run.sh` 无 LLM 完整跑通：确认新 topics 查询生效、回溯日志出现（`Backfilled N days`）、无 LLM 分析 opportunities 为空、analyzer_version 标记正确
-- [ ] **V2**: 运行后检查速率消耗（spec §2.5 预算）：`sqlite3 data/framework.db "SELECT COUNT(*) FROM star_history WHERE sampled_at < date('now')"` 有合成行；观察 discover 日志无 rate limit 等待
+- [ ] **V2**: 运行前后实测速率消耗（spec §4 验证项 3 + §2.5 预算）：
+
+```bash
+TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2)
+curl -s -H "Authorization: Bearer $TOKEN" https://api.github.com/rate_limit | python3 -c "import json,sys; r=json.load(sys.stdin)['resources']['core']; print('before:', r['remaining'])"
+./run.sh   # 或单独 python3 framework/stages/discover.py
+curl -s -H "Authorization: Bearer $TOKEN" https://api.github.com/rate_limit | python3 -c "import json,sys; r=json.load(sys.stdin)['resources']['core']; print('after:', r['remaining'])"
+```
+
+Expected: 消耗量（before−after）符合 §2.5 预算（稳态 ~400-500，含存量回溯的首日 ~600-1200）；`sqlite3 data/framework.db "SELECT COUNT(*) FROM star_history WHERE sampled_at < date('now')"` 有合成行；discover 日志无长时间 rate limit 等待
 - [ ] **V3**: `USE_LLM=true CLI_TOOL="claude --dangerously-skip-permissions" python3 framework/stages/analyze.py --date $(date -u +%Y-%m-%d) --use-llm --max-tasks 1`：确认 LLM 分析产出与项目实际相关的机会
 - [ ] **V4**: `python3 framework/stages/validate.py --metrics-only` 与 `python3 framework/stages/reweight.py --dry-run` 均不崩
 - [ ] **V5**: 连续两天跑 `./run.sh`：确认 active 项目不再每天重复生成 incremental 任务（spec §4 验证项 8）
