@@ -48,6 +48,13 @@ MAX_ADJUSTMENT_RATIO = 0.20
 MIN_SAMPLES = 20
 
 
+def _to_float(val, default=0.0):
+    try:
+        return float(val) if val is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
 def fetch_outcomes(db: Database):
     """Fetch all non-pending prediction outcomes with component scores."""
     conn = db.get_conn()
@@ -60,7 +67,15 @@ def fetch_outcomes(db: Database):
             FROM prediction_outcomes
             WHERE outcome IN ('true_positive', 'false_positive')
         ''')
-        rows = [dict(row) for row in cursor.fetchall()]
+        rows = []
+        for row in cursor.fetchall():
+            r = dict(row)
+            r['overall_score_at_prediction'] = _to_float(r.get('overall_score_at_prediction'))
+            r['star_velocity_at_pred'] = _to_float(r.get('star_velocity_at_pred'))
+            r['activity_index_at_pred'] = _to_float(r.get('activity_index_at_pred'))
+            r['community_buzz_at_pred'] = _to_float(r.get('community_buzz_at_pred'))
+            r['novelty_at_pred'] = _to_float(r.get('novelty_at_pred'))
+            rows.append(r)
         return rows
     finally:
         conn.close()
@@ -241,11 +256,20 @@ def load_current_weights(config_path):
     except Exception:
         return weights, min_score
 
+    if not cfg:
+        return weights, min_score
     eb = cfg.get('early_burst') or {}
-    min_score = eb.get('min_score', 0.65)
+    try:
+        min_score = float(eb.get('min_score', 0.65))
+    except (ValueError, TypeError):
+        min_score = 0.65
     metrics = eb.get('metrics', {})
     for comp in COMPONENTS:
-        weights[comp] = metrics.get(comp, {}).get('weight', 0.25)
+        raw = metrics.get(comp, {}).get('weight', 0.25)
+        try:
+            weights[comp] = float(raw) if raw is not None else 0.25
+        except (ValueError, TypeError):
+            weights[comp] = 0.25
     return weights, min_score
 
 
@@ -258,6 +282,9 @@ def apply_config_changes(config_path, new_weights, new_min_score):
     """
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
+
+    if not cfg or not isinstance(cfg, dict):
+        cfg = {}
 
     eb = cfg.setdefault('early_burst', {})
     eb['min_score'] = new_min_score
@@ -366,6 +393,10 @@ def main():
     )
 
     if args.apply:
+        if not os.path.exists(config_path):
+            print(f"\nERROR: Config file not found: {config_path}")
+            print("Cannot apply changes without an existing config file.")
+            sys.exit(1)
         # Backup config
         backup_path = f"{config_path}.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         shutil.copy(config_path, backup_path)

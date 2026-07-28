@@ -2,6 +2,7 @@
 import os
 import sys
 import argparse
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
@@ -14,8 +15,9 @@ def _escape_md(text) -> str:
     text = str(text).replace('\\', '\\\\').replace('|', '\\|')
     text = text.replace('[', '\\[').replace(']', '\\]')
     text = text.replace('*', '\\*').replace('_', '\\_')
-    text = text.replace('`', '\\`')
-    text = text.replace('\n', ' ')
+    text = text.replace('`', '\\`').replace('<', '\\<').replace('>', '\\>')
+    text = text.replace('(', '\\(').replace(')', '\\)')
+    text = text.replace('\r', ' ').replace('\t', ' ').replace('\n', ' ')
     return text
 
 
@@ -39,12 +41,12 @@ class ReportGenerator:
                            ) as rn
                     FROM early_burst_signals
                 ) e ON p.id = e.project_id AND e.rn = 1 AND e.is_early_burst = 1
-                ORDER BY e.overall_score DESC
+                ORDER BY CAST(e.overall_score AS REAL) DESC
             ''').fetchall()
 
             # Get summary stats
             total_projects = conn.execute(
-                "SELECT COUNT(*) FROM projects WHERE (first_seen_at IS NOT NULL AND substr(first_seen_at, 1, 10) <= ?) OR first_seen_at IS NULL",
+                "SELECT COUNT(*) FROM projects WHERE date(first_seen_at) <= ? OR first_seen_at IS NULL OR first_seen_at = ''",
                 (date,)
             ).fetchone()[0]
 
@@ -57,7 +59,7 @@ class ReportGenerator:
             """).fetchone()[0]
 
             total_analyzed = conn.execute(
-                "SELECT COUNT(DISTINCT project_id) FROM analyses WHERE substr(analyzed_at, 1, 10) = ?",
+                "SELECT COUNT(DISTINCT project_id) FROM analyses WHERE date(analyzed_at) = ?",
                 (date,)
             ).fetchone()[0]
 
@@ -66,17 +68,24 @@ class ReportGenerator:
             ).fetchone()[0]
 
             # Validation metrics
-            total_evaluated = conn.execute(
-                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome != 'pending'"
-            ).fetchone()[0] or 0
-
-            tp_count = conn.execute(
-                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'true_positive'"
-            ).fetchone()[0] or 0
-
-            fp_count = conn.execute(
-                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'false_positive'"
-            ).fetchone()[0] or 0
+            try:
+                total_evaluated = int(conn.execute(
+                    "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome IN ('true_positive', 'false_positive')"
+                ).fetchone()[0] or 0)
+            except (ValueError, TypeError):
+                total_evaluated = 0
+            try:
+                tp_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'true_positive'"
+                ).fetchone()[0] or 0)
+            except (ValueError, TypeError):
+                tp_count = 0
+            try:
+                fp_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'false_positive'"
+                ).fetchone()[0] or 0)
+            except (ValueError, TypeError):
+                fp_count = 0
 
             # Tech stack distribution (latest analysis per project only)
             tech_distribution = conn.execute('''
@@ -134,22 +143,34 @@ class ReportGenerator:
 
             if total_evaluated > 0:
                 precision = tp_count / total_evaluated
-                avg_tp = conn.execute('''
-                    SELECT AVG(growth_rate_actual) FROM prediction_outcomes
-                    WHERE outcome = 'true_positive'
-                ''').fetchone()[0] or 0
-                avg_fp = conn.execute('''
-                    SELECT AVG(growth_rate_actual) FROM prediction_outcomes
-                    WHERE outcome = 'false_positive'
-                ''').fetchone()[0] or 0
-                avg_pred_tp = conn.execute('''
-                    SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
-                    WHERE outcome = 'true_positive'
-                ''').fetchone()[0] or 0
-                avg_pred_fp = conn.execute('''
-                    SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
-                    WHERE outcome = 'false_positive'
-                ''').fetchone()[0] or 0
+                try:
+                    avg_tp = float(conn.execute('''
+                        SELECT AVG(growth_rate_actual) FROM prediction_outcomes
+                        WHERE outcome = 'true_positive'
+                    ''').fetchone()[0] or 0)
+                except (ValueError, TypeError):
+                    avg_tp = 0.0
+                try:
+                    avg_fp = float(conn.execute('''
+                        SELECT AVG(growth_rate_actual) FROM prediction_outcomes
+                        WHERE outcome = 'false_positive'
+                    ''').fetchone()[0] or 0)
+                except (ValueError, TypeError):
+                    avg_fp = 0.0
+                try:
+                    avg_pred_tp = float(conn.execute('''
+                        SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
+                        WHERE outcome = 'true_positive'
+                    ''').fetchone()[0] or 0)
+                except (ValueError, TypeError):
+                    avg_pred_tp = 0.0
+                try:
+                    avg_pred_fp = float(conn.execute('''
+                        SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
+                        WHERE outcome = 'false_positive'
+                    ''').fetchone()[0] or 0)
+                except (ValueError, TypeError):
+                    avg_pred_fp = 0.0
                 lines.append(f"- **Predictions evaluated:** {total_evaluated} (TP: {tp_count}, FP: {fp_count})")
                 lines.append(f"- **Precision (7d+ horizon):** {precision:.1%}")
                 lines.append(f"- **Avg actual growth — TP:** {avg_tp:.1f} stars/day, FP: {avg_fp:.1f} stars/day")
@@ -167,7 +188,7 @@ class ReportGenerator:
                         COUNT(*) as total,
                         SUM(CASE WHEN outcome = 'true_positive' THEN 1 ELSE 0 END) as tp_count
                     FROM prediction_outcomes
-                    WHERE outcome != 'pending'
+                    WHERE outcome IN ('true_positive', 'false_positive')
                     GROUP BY bucket
                     ORDER BY MIN(overall_score_at_prediction) DESC
                 ''').fetchall()
@@ -175,8 +196,16 @@ class ReportGenerator:
                 if buckets:
                     lines.extend(["", "### Score Bucket Calibration", "", "| Bucket | Evaluated | Precision |", "|--------|-----------|-----------|"])
                     for b in buckets:
-                        b_prec = b['tp_count'] / b['total'] if b['total'] > 0 else 0
-                        lines.append(f"| {b['bucket']} | {b['total']} | {b_prec:.1%} |")
+                        try:
+                            b_total = int(b['total']) if b['total'] is not None else 0
+                        except (ValueError, TypeError):
+                            b_total = 0
+                        try:
+                            b_tp = int(b['tp_count']) if b['tp_count'] is not None else 0
+                        except (ValueError, TypeError):
+                            b_tp = 0
+                        b_prec = b_tp / b_total if b_total > 0 else 0
+                        lines.append(f"| {b['bucket']} | {b_total} | {b_prec:.1%} |")
             else:
                 lines.append("_No predictions have matured enough for evaluation._")
 
@@ -211,14 +240,16 @@ class ReportGenerator:
                 for i, opp in enumerate(top_opportunities, 1):
                     score = opp['overall_score'] if opp['overall_score'] is not None else 'N/A'
                     proj_name = _escape_md(opp['project_name']) or 'Unnamed'
-                    proj_url = _escape_md(opp['project_url']) or 'N/A'
-                    opp_title = _escape_md(opp['title']) or 'Untitled'
+                    raw_url = opp['project_url'] or ''
+                    safe_url = _escape_md(quote(raw_url, safe='/:?#[]@!$&\'*+,;=')) if raw_url else 'N/A'
+                    raw_title = _escape_md(opp['title']) or 'Untitled'
+                    opp_title = raw_title if len(raw_title) <= 80 else raw_title[:77] + '...'
                     opp_type = _escape_md(opp['opportunity_type']) or 'unknown'
                     impact = _escape_md(opp['impact_potential']) or 'N/A'
                     difficulty = _escape_md(opp['difficulty']) or 'N/A'
                     horizon = _escape_md(opp['time_horizon']) or 'N/A'
                     lines.append(
-                        f"| {i} | [{proj_name}]({proj_url}) | {opp_title} | "
+                        f"| {i} | [{proj_name}]({safe_url}) | {opp_title} | "
                         f"{opp_type} | {impact} | {score} | "
                         f"{difficulty} | {horizon} |"
                     )
@@ -238,13 +269,14 @@ class ReportGenerator:
                 app = _escape_md(p['application']) or 'TBD'
                 proj_name = _escape_md(p['name']) or 'Unnamed'
                 proj_url = _escape_md(p['url']) or 'N/A'
-                proj_desc = _escape_md(p['description']) or 'No description'
+                raw_desc = _escape_md(p['description']) or 'No description'
+                proj_desc = raw_desc if len(raw_desc) <= 200 else raw_desc[:197] + '...'
                 lang = _escape_md(p['language']) or 'N/A'
 
                 lines.extend([
                     f"### {i}. {proj_name}",
                     "",
-                    f"**Score:** {p['overall_score'] or 0:.2f} (Velocity: {p['star_velocity_score'] or 0:.2f}, Activity: {p['activity_index_score'] or 0:.2f}, Buzz: {p['community_buzz_score'] or 0:.2f}, Novelty: {p['novelty_score'] or 0:.2f})",
+                    f"**Score:** {float(p['overall_score'] or 0):.2f} (Velocity: {float(p['star_velocity_score'] or 0):.2f}, Activity: {float(p['activity_index_score'] or 0):.2f}, Buzz: {float(p['community_buzz_score'] or 0):.2f}, Novelty: {float(p['novelty_score'] or 0):.2f})",
                     "",
                     f"**Classification:** {tech} / {app}",
                     "",

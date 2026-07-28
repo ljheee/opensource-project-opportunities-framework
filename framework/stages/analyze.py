@@ -12,7 +12,7 @@ import shlex
 import shutil
 import subprocess
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
@@ -40,20 +40,30 @@ def _is_whole_word(text: str, pattern: str) -> bool:
     return False
 
 
-def _calculate_peer_percentile(project_stars: int, peers: List[Dict]) -> tuple[float, int, int]:
+def _calculate_peer_percentile(project_stars: int, peers: List[Dict]) -> Tuple[float, int, int]:
     """Calculate star count percentile within peer group.
 
     Returns (percentile, peers_below, total_peers).
     """
     if not peers:
         return 0.0, 0, 0
-    peer_stars = [p.get('stars', 0) or 0 for p in peers]
+    try:
+        ps = int(project_stars) if project_stars is not None else 0
+    except (ValueError, TypeError):
+        ps = 0
+    peer_stars = []
+    for p in peers:
+        try:
+            s = int(p.get('stars')) if p.get('stars') is not None else 0
+        except (ValueError, TypeError):
+            s = 0
+        peer_stars.append(s)
     total = len(peer_stars)
-    below = sum(1 for s in peer_stars if project_stars > s)
+    below = sum(1 for s in peer_stars if ps > s)
     # If tied with highest, treat as 100th percentile
-    if project_stars >= max(peer_stars):
+    if peer_stars and ps >= max(peer_stars):
         return 100.0, below, total
-    percentile = (below / total) * 100
+    percentile = (below / total) * 100 if total > 0 else 0.0
     return percentile, below, total
 
 
@@ -88,6 +98,10 @@ def _detect_inflection(star_history: List[Dict]) -> Optional[Dict]:
         try:
             da = datetime.fromisoformat(a['sampled_at'].replace('Z', '+00:00'))
             db = datetime.fromisoformat(b['sampled_at'].replace('Z', '+00:00'))
+            if da.tzinfo is None:
+                da = da.replace(tzinfo=timezone.utc)
+            if db.tzinfo is None:
+                db = db.replace(tzinfo=timezone.utc)
             return max((db - da).total_seconds() / 86400, 1.0)
         except (ValueError, TypeError, KeyError):
             return 1.0
@@ -95,9 +109,18 @@ def _detect_inflection(star_history: List[Dict]) -> Optional[Dict]:
     days_prior = days_between(earliest, mid)
     days_recent = days_between(mid, latest)
 
-    stars_earliest = earliest.get('stars', 0) or 0
-    stars_mid = mid.get('stars', 0) or 0
-    stars_latest = latest.get('stars', 0) or 0
+    try:
+        stars_earliest = int(earliest.get('stars', 0) or 0)
+    except (ValueError, TypeError):
+        stars_earliest = 0
+    try:
+        stars_mid = int(mid.get('stars', 0) or 0)
+    except (ValueError, TypeError):
+        stars_mid = 0
+    try:
+        stars_latest = int(latest.get('stars', 0) or 0)
+    except (ValueError, TypeError):
+        stars_latest = 0
 
     slope_prior = (stars_mid - stars_earliest) / days_prior
     slope_recent = (stars_latest - stars_mid) / days_recent
@@ -110,9 +133,10 @@ def _detect_inflection(star_history: List[Dict]) -> Optional[Dict]:
         phase = 'accelerating' if slope_recent > 0 else 'decline'
         ratio = None  # ratio is meaningless when prior <= 0
     else:
-        # Guard against near-zero slope_prior causing extreme ratios
-        safe_slope_prior = max(slope_prior, 0.01)
-        ratio = round(slope_recent / safe_slope_prior, 2)
+        # Guard against near-zero slope_prior causing extreme ratios;
+        # cap ratio at 100 so tiny prior slopes don't distort classification.
+        safe_slope_prior = max(slope_prior, 0.0001)
+        ratio = round(min(slope_recent / safe_slope_prior, 100.0), 2)
         if ratio >= 1.5:
             phase = 'accelerating'
         elif ratio >= 0.8:
@@ -120,7 +144,7 @@ def _detect_inflection(star_history: List[Dict]) -> Optional[Dict]:
         elif ratio >= 0.5:
             phase = 'decelerating'
         else:
-            phase = 'decelerating'
+            phase = 'decline'
 
     return {
         'phase': phase,
@@ -207,7 +231,7 @@ def get_pending_analysis_tasks(db: Database, date: str, limit: int = 10) -> List
         conn.close()
 
 
-def validate_opportunity(opp: Dict) -> tuple[bool, str]:
+def validate_opportunity(opp: Dict) -> Tuple[bool, str]:
     """Validate opportunity structure and values."""
     required_fields = ['opportunity_type', 'title', 'description']
     for field in required_fields:
@@ -331,9 +355,9 @@ def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Di
             conn.commit()
         return opportunities_stored
 
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        raise e
+        raise
     finally:
         if should_close:
             conn.close()
@@ -391,7 +415,7 @@ def extract_json_from_text(text: str) -> Optional[Dict]:
         return None
 
 
-def validate_analysis_output(analysis: Dict) -> tuple[bool, str, Dict]:
+def validate_analysis_output(analysis: Dict) -> Tuple[bool, str, Dict]:
     """Validate that LLM output has required structure.
 
     Returns (is_valid, error_message, cleaned_analysis).  The returned
@@ -438,7 +462,9 @@ def _format_prompt(template: str, values: Dict[str, str]) -> str:
     """Replace only known placeholders, leaving all other braces untouched."""
     if not values:
         return template
-    pattern = re.compile(r'\{(' + '|'.join(re.escape(k) for k in values) + r')\}')
+    # Sort keys by length descending so longer keys match before shorter prefixes
+    sorted_keys = sorted(values.keys(), key=len, reverse=True)
+    pattern = re.compile(r'\{(' + '|'.join(re.escape(k) for k in sorted_keys) + r')\}')
     return pattern.sub(lambda m: str(values.get(m.group(1), m.group(0))), template)
 
 
@@ -467,8 +493,12 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
         traj_lines.append("|------|-------|-------------|")
         prev_stars = None
         for entry in star_history:
-            date_str = entry.get('sampled_at', 'N/A')[:10]
-            stars = entry.get('stars', 0)
+            sampled = entry.get('sampled_at') or 'N/A'
+            date_str = str(sampled)[:10]
+            try:
+                stars = int(entry.get('stars', 0) or 0)
+            except (ValueError, TypeError):
+                stars = 0
             if prev_stars is not None and prev_stars > 0:
                 gain = stars - prev_stars
                 pct = f"{gain:+d} ({gain/prev_stars*100:+.1f}%)"
@@ -533,10 +563,10 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
         'language': project.get('language') or 'N/A',
         'stars': project.get('stars') or 0,
         'topics': topics or '[]',
-        'overall_score': (project.get('burst_signals') or {}).get('overall_score') or 'N/A',
-        'star_velocity': (project.get('burst_signals') or {}).get('star_velocity_score') or 'N/A',
-        'activity_index': (project.get('burst_signals') or {}).get('activity_index_score') or 'N/A',
-        'novelty': (project.get('burst_signals') or {}).get('novelty_score') or 'N/A',
+        'overall_score': (project.get('burst_signals') or {}).get('overall_score') if (project.get('burst_signals') or {}).get('overall_score') is not None else 'N/A',
+        'star_velocity': (project.get('burst_signals') or {}).get('star_velocity_score') if (project.get('burst_signals') or {}).get('star_velocity_score') is not None else 'N/A',
+        'activity_index': (project.get('burst_signals') or {}).get('activity_index_score') if (project.get('burst_signals') or {}).get('activity_index_score') is not None else 'N/A',
+        'novelty': (project.get('burst_signals') or {}).get('novelty_score') if (project.get('burst_signals') or {}).get('novelty_score') is not None else 'N/A',
         'star_trajectory': star_trajectory,
         'peer_comparison': peer_comparison,
         'inflection_analysis': inflection_analysis,
@@ -574,11 +604,19 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
                 deduped.append(arg)
             extra_args = deduped
 
-        cfg = resilience_config or {}
-        max_retries = cfg.get('max_retries', 2)
+        cfg = resilience_config if isinstance(resilience_config, dict) else {}
+        try:
+            max_retries = int(cfg.get('max_retries', 2))
+        except (ValueError, TypeError):
+            max_retries = 2
         if max_retries < 1:
             max_retries = 1
-        timeout = cfg.get('timeout_seconds', 300)
+        try:
+            timeout = int(cfg.get('timeout_seconds', 300))
+        except (ValueError, TypeError):
+            timeout = 300
+        if timeout < 1:
+            timeout = 300
         for attempt in range(1, max_retries + 1):
             try:
                 if is_agent:
@@ -638,27 +676,34 @@ def generate_heuristic_analysis(project: Dict) -> Dict:
             topics = []
     if not topics:
         topics = []
-    topics_str = ' '.join(topics).lower()
+    topics_str = ' '.join(str(t) for t in topics).lower()
 
     # Determine tech layer (whole-word match to avoid false positives)
     tech_layer = 'ai_application'
-    if any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['model', 'llm', 'gpt', 'foundation']):
-        tech_layer = 'foundation_model'
-    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['training', 'fine-tune']):
+    if any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['model', 'llm', 'gpt', 'foundation', 'bert']):
+        if any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['inference', 'serving', 'deployment']):
+            tech_layer = 'inference_engine'
+        else:
+            tech_layer = 'foundation_model'
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['training', 'fine-tune', 'distributed']):
         tech_layer = 'training_framework'
-    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['inference', 'serving', 'deploy']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['inference', 'serving', 'deployment']):
         tech_layer = 'inference_engine'
-    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['tool', 'sdk', 'library']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['tool', 'sdk', 'library', 'framework']):
         tech_layer = 'ai_toolchain'
 
     # Determine application
     application = 'multimodal'
-    if any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['code', 'coding', 'developer']):
+    if any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['code', 'coding', 'programming', 'developer']):
         application = 'code_generation'
-    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['image', 'vision', 'diffusion']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['image', 'diffusion', 'stable-diffusion', 'vision']):
         application = 'image_generation'
-    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['agent', 'autonomous']):
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['agent', 'autonomous', 'bot']):
         application = 'agent'
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['data', 'annotation', 'label', 'dataset']):
+        application = 'data_annotation'
+    elif any(_is_whole_word(topics_str, kw) or _is_whole_word(description, kw) for kw in ['eval', 'benchmark', 'safety', 'test']):
+        application = 'model_evaluation'
 
     # Generate opportunities based on project type
     opportunities = []
@@ -723,9 +768,9 @@ def generate_heuristic_analysis(project: Dict) -> Dict:
         'innovation_summary': 'Open source implementation with community contributions',
         'differentiation': 'Open source alternative to proprietary solutions',
         'market_timing': 'Growing demand for open AI tools',
-        'ecosystem_position': 'application_layer' if tech_layer == 'ai_application' else 'middleware',
+        'ecosystem_position': 'application_layer' if tech_layer == 'ai_application' else ('base_layer' if tech_layer in ('foundation_model', 'training_framework') else 'middleware'),
         'commercialization_path': 'Offer hosted service or enterprise support based on open-source adoption',
-        'overall_score': min(10, max(1, 5 + int(((project.get('burst_signals') or {}).get('overall_score') or 0) * 5))),
+        'overall_score': min(10, max(1, 5 + int(float(((project.get('burst_signals') or {}).get('overall_score') or 0)) * 5))),
         'opportunities': opportunities
     }
 
@@ -751,12 +796,14 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
         print(f"\nAnalyzing: {project_id}")
 
         conn = db.get_conn()
+        previous_status = 'scheduled'
+        committed = False
         try:
             # Save previous status for recovery on failure
             prev_status_row = conn.execute(
                 "SELECT status FROM projects WHERE id=?", (project_id,)
             ).fetchone()
-            previous_status = prev_status_row['status'] if prev_status_row else 'scheduled'
+            previous_status = (prev_status_row['status'] or 'scheduled') if prev_status_row else 'scheduled'
 
             # Mark task as running and project as analyzing (same transaction)
             scheduler.mark_task_running(task['id'], conn=conn)
@@ -791,6 +838,7 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
             scheduler.mark_task_done(task['id'], opportunities_count, conn=conn)
             conn.execute("UPDATE projects SET status='active' WHERE id=?", (project_id,))
             conn.commit()
+            committed = True
 
             analyzed += 1
             total_opportunities += opportunities_count
@@ -799,13 +847,16 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
 
         except Exception as e:
             print(f"  Error analyzing {project_id}: {e}")
-            try:
-                conn.rollback()
-                scheduler.mark_task_failed(task['id'], str(e)[:100], conn=conn)
-                conn.execute("UPDATE projects SET status=? WHERE id=?", (previous_status, project_id))
-                conn.commit()
-            except Exception as status_err:
-                print(f"  Warning: Could not reset project status: {status_err}")
+            if committed:
+                print(f"  Warning: Exception after commit; task already marked done")
+            else:
+                try:
+                    conn.rollback()
+                    scheduler.mark_task_failed(task['id'], str(e)[:100], conn=conn)
+                    conn.execute("UPDATE projects SET status=? WHERE id=?", (previous_status, project_id))
+                    conn.commit()
+                except Exception as status_err:
+                    print(f"  Warning: Could not reset project status: {status_err}")
         finally:
             conn.close()
 

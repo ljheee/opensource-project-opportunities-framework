@@ -1,4 +1,4 @@
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, field
 from typing import List, Dict, Optional, Any
 import yaml
 import os
@@ -6,9 +6,9 @@ import os
 
 @dataclass
 class CategoryConfig:
-    name: str
-    display_name: str
-    version: str
+    name: str = 'ai'
+    display_name: str = 'AI Projects'
+    version: str = '1.0'
 
 
 @dataclass
@@ -19,9 +19,9 @@ class DimensionsConfig:
 
 @dataclass
 class EarlyBurstConfig:
-    enabled: bool
-    min_score: float
-    metrics: Dict[str, Any]
+    enabled: bool = True
+    min_score: float = 0.65
+    metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 class ConfigLoader:
@@ -43,6 +43,8 @@ class ConfigLoader:
                 raise RuntimeError(f"Invalid YAML in config file {self.config_path}: {e}")
             if raw is None:
                 raise RuntimeError(f"Config file is empty: {self.config_path}")
+            if not isinstance(raw, dict):
+                raise RuntimeError(f"Config file must contain a mapping (dict), got {type(raw).__name__}: {self.config_path}")
             self._config = raw
         return self._config
 
@@ -53,7 +55,7 @@ class ConfigLoader:
         return cfg[key]
 
     def get_category(self) -> CategoryConfig:
-        cat = self._require_key('category')
+        cat = self._require_key('category') or {}
         valid_keys = {f.name for f in fields(CategoryConfig)}
         return CategoryConfig(**{k: v for k, v in cat.items() if k in valid_keys})
 
@@ -65,9 +67,25 @@ class ConfigLoader:
         )
 
     def get_early_burst_config(self) -> EarlyBurstConfig:
-        eb = self._require_key('early_burst')
+        eb = self._require_key('early_burst') or {}
         valid_keys = {f.name for f in fields(EarlyBurstConfig)}
-        return EarlyBurstConfig(**{k: v for k, v in eb.items() if k in valid_keys})
+        filtered = {k: v for k, v in eb.items() if k in valid_keys}
+        # Type safety: enabled / min_score may come from YAML as strings
+        if 'enabled' in filtered:
+            v = filtered['enabled']
+            if isinstance(v, str):
+                filtered['enabled'] = v.lower() in ('true', '1', 'yes', 'on')
+            else:
+                filtered['enabled'] = bool(v)
+        if 'min_score' in filtered:
+            try:
+                filtered['min_score'] = float(filtered['min_score'])
+            except (ValueError, TypeError):
+                filtered['min_score'] = 0.65
+        # Guard against malformed metrics value
+        if not isinstance(filtered.get('metrics'), dict):
+            filtered['metrics'] = {}
+        return EarlyBurstConfig(**filtered)
 
     def get_github_topics(self) -> List[str]:
         topics = ((self.load().get('sources') or {}).get('github') or {}).get('topics', [])
@@ -91,10 +109,13 @@ class ConfigLoader:
         return ecosystems if isinstance(ecosystems, list) else []
 
     def get_filters(self) -> Dict:
-        return self.load().get('filters') or {}
+        val = self.load().get('filters')
+        return val if isinstance(val, dict) else {}
 
     def get_scheduling_config(self) -> Dict:
-        return self.load().get('scheduling') or {}
+        val = self.load().get('scheduling')
+        return val if isinstance(val, dict) else {}
 
     def get_resilience_config(self) -> Dict:
-        return self.load().get('resilience') or {}
+        val = self.load().get('resilience')
+        return val if isinstance(val, dict) else {}

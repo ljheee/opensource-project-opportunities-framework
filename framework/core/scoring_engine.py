@@ -8,16 +8,30 @@ class ScoringEngine:
         self.config = config
 
     def _thresholds(self, metric_name: str) -> Dict:
-        return self.config.metrics.get(metric_name, {}).get('thresholds', {})
+        val = self.config.metrics.get(metric_name, {}).get('thresholds', {})
+        return val if isinstance(val, dict) else {}
 
     def _weight(self, metric_name: str) -> float:
-        return self.config.metrics.get(metric_name, {}).get('weight', 0.25)
+        val = self.config.metrics.get(metric_name, {}).get('weight', 0.25)
+        try:
+            w = float(val) if val is not None else 0.25
+        except (ValueError, TypeError):
+            return 0.25
+        return max(w, 0.0)
 
     def _volume_score(self, current: int, past: int, days: int) -> float:
         """Raw volume score for a given lookback period."""
+        if days <= 0:
+            return 0.0
         threshold = self._thresholds('star_velocity')
-        target_weekly = max(threshold.get('weekly_growth_rate', 0.15), 0.0001)
-        target_daily = max(threshold.get('daily_absolute', 10), 0.0001)
+        try:
+            target_weekly = max(float(threshold.get('weekly_growth_rate', 0.15)), 0.0001)
+        except (ValueError, TypeError):
+            target_weekly = 0.15
+        try:
+            target_daily = max(float(threshold.get('daily_absolute', 10)), 0.0001)
+        except (ValueError, TypeError):
+            target_daily = 10
 
         if past > 0:
             weekly_growth = ((current - past) / past) / (days / 7)
@@ -93,8 +107,14 @@ class ScoringEngine:
                                   commit_frequency: float,
                                   pr_merge_rate: Optional[float] = None) -> float:
         threshold = self._thresholds('activity_index')
-        commit_freq_thresh = threshold.get('commit_frequency', 3)
-        pr_merge_thresh = threshold.get('pr_merge_rate', 0.3)
+        try:
+            commit_freq_thresh = max(float(threshold.get('commit_frequency', 3)), 0.0)
+        except (ValueError, TypeError):
+            commit_freq_thresh = 3
+        try:
+            pr_merge_thresh = max(float(threshold.get('pr_merge_rate', 0.3)), 0.0)
+        except (ValueError, TypeError):
+            pr_merge_thresh = 0.3
         score = 0.0
 
         if commit_frequency >= commit_freq_thresh:
@@ -135,26 +155,47 @@ class ScoringEngine:
             return 0.5
 
         threshold = self._thresholds('novelty_signal')
-        max_months = threshold.get('first_commit_within_months', 6) * 2
+        try:
+            max_months = float(threshold.get('first_commit_within_months', 6)) * 2
+        except (ValueError, TypeError):
+            max_months = 12
 
-        age_score = max(0, 1.0 - (months_old / max_months)) if max_months > 0 else 0.5
+        age_score = max(0, min(1.0, 1.0 - (months_old / max_months))) if max_months > 0 else 0.5
 
-        contrib_threshold = threshold.get('unique_contributors_weekly', 2)
+        try:
+            contrib_threshold = float(threshold.get('unique_contributors_weekly', 2))
+        except (ValueError, TypeError):
+            contrib_threshold = 2
         contrib_score = min(unique_contributors_weekly / contrib_threshold, 1.0) if contrib_threshold > 0 else 0
 
         return min(age_score * 0.6 + contrib_score * 0.4, 1.0)
 
     def default_buzz_score(self) -> float:
         """Return default community buzz score when data is unavailable."""
-        return self._thresholds('community_buzz').get('default_score', 0.3)
+        try:
+            return max(float(self._thresholds('community_buzz').get('default_score', 0.3)), 0.0)
+        except (ValueError, TypeError):
+            return 0.3
 
     def calculate_overall(self, star_velocity: float, activity: float,
                           buzz: float, novelty: float) -> Dict[str, Any]:
+        raw_weights = {
+            'star_velocity': self._weight('star_velocity'),
+            'activity_index': self._weight('activity_index'),
+            'community_buzz': self._weight('community_buzz'),
+            'novelty_signal': self._weight('novelty_signal'),
+        }
+        total_weight = sum(raw_weights.values())
+        if total_weight > 0:
+            weights = {k: v / total_weight for k, v in raw_weights.items()}
+        else:
+            weights = {k: 0.25 for k in raw_weights}
+
         overall = (
-            star_velocity * self._weight('star_velocity') +
-            activity * self._weight('activity_index') +
-            buzz * self._weight('community_buzz') +
-            novelty * self._weight('novelty_signal')
+            star_velocity * weights['star_velocity'] +
+            activity * weights['activity_index'] +
+            buzz * weights['community_buzz'] +
+            novelty * weights['novelty_signal']
         )
 
         return {

@@ -13,12 +13,8 @@ from framework.core.scheduler import Scheduler
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['bulk', 'incremental'], default='incremental')
-    parser.add_argument('--batch-size', type=int, default=20)
+    parser.add_argument('--batch-size', type=int, default=None)
     args = parser.parse_args()
-
-    if args.batch_size <= 0:
-        print("ERROR: batch-size must be a positive integer")
-        sys.exit(1)
 
     config = ConfigLoader()
     db = Database()
@@ -28,11 +24,26 @@ def main():
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
     if args.mode == 'bulk':
-        count = scheduler.generate_bulk_tasks(today, args.batch_size)
+        if args.batch_size is None:
+            bulk_cfg = config.get_scheduling_config().get('bulk', {})
+            try:
+                batch_size = int(bulk_cfg.get('batch_size', 20))
+            except (ValueError, TypeError):
+                batch_size = 20
+        else:
+            batch_size = args.batch_size
+        if batch_size <= 0:
+            print("ERROR: batch-size must be a positive integer")
+            sys.exit(1)
+        count = scheduler.generate_bulk_tasks(today, batch_size)
     else:
         scheduling_cfg = config.get_scheduling_config()
         incremental_cfg = scheduling_cfg.get('incremental', {})
-        max_tasks = incremental_cfg.get('max_per_day', 15)
+        try:
+            max_tasks = int(incremental_cfg.get('max_per_day', 15))
+        except (ValueError, TypeError):
+            print("ERROR: incremental max_per_day must be a positive integer")
+            sys.exit(1)
         if max_tasks <= 0:
             print("ERROR: incremental max_per_day must be a positive integer")
             sys.exit(1)

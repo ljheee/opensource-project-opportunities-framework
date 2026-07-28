@@ -32,9 +32,28 @@ class Database:
 
     def _migrate_projects(self, conn):
         """Migrate projects table: add missing columns."""
+        self._add_column_if_missing(conn, 'projects', 'first_commit_at', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'last_commit_at', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'topics', 'TEXT')
         self._add_column_if_missing(conn, 'projects', 'description', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'tech_layer', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'application', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'category', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'source', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'status', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'filter_reason', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'first_seen_at', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'last_fetched_at', 'TEXT')
+        self._add_column_if_missing(conn, 'projects', 'contributor_count', 'INTEGER')
         self._add_column_if_missing(conn, 'projects', 'prev_stars', 'INTEGER')
         self._add_column_if_missing(conn, 'projects', 'prev_open_issues', 'INTEGER')
+
+    def _migrate_tasks(self, conn):
+        """Migrate tasks table: add missing columns."""
+        if not self._table_exists(conn, 'tasks'):
+            return
+        self._add_column_if_missing(conn, 'tasks', 'early_burst_score', 'REAL')
+        self._add_column_if_missing(conn, 'tasks', 'opportunities_found', 'INTEGER')
 
     def _migrate_prediction_outcomes(self, conn):
         """Migrate prediction_outcomes table: add component score columns."""
@@ -94,7 +113,7 @@ class Database:
         conn.execute("""
             CREATE TABLE analyses_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id TEXT,
+                project_id TEXT REFERENCES projects(id),
                 analyzed_at TEXT,
                 tech_layer TEXT,
                 application TEXT,
@@ -109,14 +128,20 @@ class Database:
             )
         """)
         conn.execute("""
-            INSERT INTO analyses_new
-                SELECT id, project_id, analyzed_at, tech_layer, application,
-                       problem_solved, innovation_summary, differentiation,
-                       market_timing, ecosystem_position, commercialization_path,
-                       CASE WHEN CAST(COALESCE(overall_score, 5) AS INTEGER) < 1 THEN 1
-                            WHEN CAST(COALESCE(overall_score, 5) AS INTEGER) > 10 THEN 10
-                            ELSE CAST(COALESCE(overall_score, 5) AS INTEGER) END,
-                       analyzer_version
+            INSERT INTO analyses_new (
+                id, project_id, analyzed_at, tech_layer, application,
+                problem_solved, innovation_summary, differentiation,
+                market_timing, ecosystem_position, commercialization_path,
+                overall_score, analyzer_version
+            )
+            SELECT
+                id, project_id, analyzed_at, tech_layer, application,
+                problem_solved, innovation_summary, differentiation,
+                market_timing, ecosystem_position, commercialization_path,
+                CASE WHEN CAST(COALESCE(overall_score, 5) AS INTEGER) < 1 THEN 1
+                     WHEN CAST(COALESCE(overall_score, 5) AS INTEGER) > 10 THEN 10
+                     ELSE CAST(COALESCE(overall_score, 5) AS INTEGER) END,
+                analyzer_version
             FROM analyses
         """)
         conn.execute("DROP TABLE analyses")
@@ -131,6 +156,7 @@ class Database:
             self._create_star_history(conn)
             self._create_early_burst_signals(conn)
             self._create_tasks(conn)
+            self._migrate_tasks(conn)
             self._migrate_projects(conn)
             self._migrate_analyses(conn)
             self._create_analyses(conn)
@@ -304,10 +330,18 @@ class Database:
                 UPDATE tasks SET status='pending', started_at=NULL
                 WHERE status='running'
             """)
-            # Bump old pending tasks to today so they remain schedulable
+            # Bump old pending tasks to today so they remain schedulable,
+            # but only if no today's task already exists (avoid UNIQUE violation)
             conn.execute("""
-                UPDATE tasks SET task_date=date('now')
+                UPDATE tasks
+                SET task_date=date('now')
                 WHERE status='pending' AND task_date < date('now')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM tasks t2
+                      WHERE t2.project_id = tasks.project_id
+                        AND t2.task_type = tasks.task_type
+                        AND t2.task_date = date('now')
+                  )
             """)
             if not self._table_exists(conn, 'projects'):
                 conn.commit()
@@ -316,22 +350,21 @@ class Database:
             conn.execute("""
                 UPDATE projects SET status='active'
                 WHERE status='analyzing'
-                  AND id IN (SELECT DISTINCT project_id FROM tasks WHERE status='done')
-                  AND id NOT IN (
-                      SELECT DISTINCT project_id FROM tasks
-                      WHERE task_type IN ('bulk','incremental','triggered')
-                        AND status IN ('pending','running')
+                  AND EXISTS (SELECT 1 FROM tasks t WHERE t.project_id = projects.id AND t.status='done')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM tasks t
+                      WHERE t.project_id = projects.id
+                        AND t.status IN ('pending','running')
                   )
             """)
-            # Priority 2: projects with pending/running tasks (bulk/incremental/triggered)
+            # Priority 2: projects with pending/running tasks
             # → reset to scheduled so they can be rescheduled/re-picked
             conn.execute("""
                 UPDATE projects SET status='scheduled'
                 WHERE status='analyzing'
                   AND id IN (
                       SELECT DISTINCT project_id FROM tasks
-                      WHERE task_type IN ('bulk','incremental','triggered')
-                        AND status IN ('pending','running')
+                      WHERE status IN ('pending','running')
                   )
             """)
             # Priority 3: remaining → reset to discovered
@@ -339,13 +372,13 @@ class Database:
             conn.execute("""
                 UPDATE projects SET status='discovered'
                 WHERE status='analyzing'
-                  AND id NOT IN (
-                      SELECT DISTINCT project_id FROM tasks
-                      WHERE task_type IN ('bulk','incremental','triggered')
-                        AND status IN ('pending','running')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM tasks t
+                      WHERE t.project_id = projects.id
+                        AND t.status IN ('pending','running')
                   )
-                  AND id NOT IN (
-                      SELECT DISTINCT project_id FROM tasks WHERE status='done'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM tasks t WHERE t.project_id = projects.id AND t.status='done'
                   )
             """)
             conn.commit()
@@ -353,23 +386,50 @@ class Database:
             conn.close()
 
     def repair_orphan_records(self):
-        """Fix tasks referencing non-existent projects."""
+        """Fix records referencing non-existent projects."""
         conn = self.get_conn()
         try:
             if self._table_exists(conn, 'tasks') and self._table_exists(conn, 'projects'):
                 conn.execute("""
                     DELETE FROM tasks
-                    WHERE project_id NOT IN (SELECT id FROM projects)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM projects WHERE projects.id = tasks.project_id
+                    )
                 """)
             if self._table_exists(conn, 'analyses') and self._table_exists(conn, 'projects'):
                 conn.execute("""
                     DELETE FROM analyses
-                    WHERE project_id NOT IN (SELECT id FROM projects)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM projects WHERE projects.id = analyses.project_id
+                    )
                 """)
             if self._table_exists(conn, 'opportunities') and self._table_exists(conn, 'projects'):
                 conn.execute("""
                     DELETE FROM opportunities
-                    WHERE project_id NOT IN (SELECT id FROM projects)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM projects WHERE projects.id = opportunities.project_id
+                    )
+                """)
+            if self._table_exists(conn, 'star_history') and self._table_exists(conn, 'projects'):
+                conn.execute("""
+                    DELETE FROM star_history
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM projects WHERE projects.id = star_history.project_id
+                    )
+                """)
+            if self._table_exists(conn, 'early_burst_signals') and self._table_exists(conn, 'projects'):
+                conn.execute("""
+                    DELETE FROM early_burst_signals
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM projects WHERE projects.id = early_burst_signals.project_id
+                    )
+                """)
+            if self._table_exists(conn, 'prediction_outcomes') and self._table_exists(conn, 'projects'):
+                conn.execute("""
+                    DELETE FROM prediction_outcomes
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM projects WHERE projects.id = prediction_outcomes.project_id
+                    )
                 """)
             conn.commit()
         finally:
@@ -420,7 +480,7 @@ class Database:
                   AND tech_layer = ?
                   AND application = ?
                   AND status IN ('active', 'scheduled')
-                ORDER BY stars DESC
+                ORDER BY CAST(stars AS INTEGER) DESC
                 LIMIT ?
             ''', (project_id, tech_layer or 'ai_application',
                   application or 'multimodal', limit))

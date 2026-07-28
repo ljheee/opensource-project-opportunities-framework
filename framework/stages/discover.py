@@ -11,7 +11,7 @@ import argparse
 import re
 import requests
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -42,6 +42,13 @@ class GitHubAPIError(Exception):
         self.retry_after = retry_after
 
 
+def _to_bool(val) -> bool:
+    """Coerce config value to bool (handles string 'false', '0', etc.)."""
+    if isinstance(val, str):
+        return val.lower() not in ('false', '0', 'no', 'off', '')
+    return bool(val)
+
+
 class DiscoverStage:
     """Multi-source project discovery stage."""
 
@@ -67,8 +74,15 @@ class DiscoverStage:
             if elapsed < 0.5:
                 time.sleep(max(0, 0.5 - elapsed))
 
-        max_retries = self.resilience.get('github_api', {}).get('max_retries', 3)
-        retry_delay = max(self.resilience.get('github_api', {}).get('retry_delay_seconds', 60), 0)
+        github_api_cfg = self.resilience.get('github_api') or {}
+        try:
+            max_retries = int(github_api_cfg.get('max_retries', 3))
+        except (ValueError, TypeError):
+            max_retries = 3
+        try:
+            retry_delay = max(int(github_api_cfg.get('retry_delay_seconds', 60)), 0)
+        except (ValueError, TypeError):
+            retry_delay = 60
         if max_retries < 1:
             max_retries = 1
 
@@ -84,20 +98,26 @@ class DiscoverStage:
 
                 # Handle rate limiting
                 if response.status_code == 403 and 'rate limit' in response.text.lower():
-                    reset_time = int(response.headers.get('X-RateLimit-Reset') or 0)
+                    if attempt >= max_retries - 1:
+                        raise GitHubAPIError(f"Rate limited after {attempt + 1} attempts")
+                    try:
+                        reset_time = int(response.headers.get('X-RateLimit-Reset') or 0)
+                    except (ValueError, TypeError):
+                        reset_time = 0
                     wait_time = max(reset_time - int(time.time()), 60)
                     print(f"  Rate limited. Waiting {wait_time}s...")
                     time.sleep(min(wait_time, 3600))
-                    if attempt >= max_retries - 1:
-                        raise GitHubAPIError(f"Rate limited after {attempt + 1} attempts")
                     continue
 
                 if response.status_code == 429:
-                    retry_after = max(int(response.headers.get('Retry-After') or 60), 0)
-                    print(f"  Too many requests. Waiting {retry_after}s...")
-                    time.sleep(min(retry_after, retry_delay))
                     if attempt >= max_retries - 1:
                         raise GitHubAPIError(f"Too many requests after {attempt + 1} attempts")
+                    try:
+                        retry_after = max(int(response.headers.get('Retry-After') or 60), 0)
+                    except (ValueError, TypeError):
+                        retry_after = 60
+                    print(f"  Too many requests. Waiting {retry_after}s...")
+                    time.sleep(min(retry_after, retry_delay))
                     continue
 
                 response.raise_for_status()
@@ -116,11 +136,14 @@ class DiscoverStage:
 
         raise GitHubAPIError("Unexpected end of retry loop")
 
-    def _should_skip_repo(self, repo: Dict) -> tuple[bool, str]:
+    def _should_skip_repo(self, repo: Dict) -> Tuple[bool, str]:
         """Check if repository should be skipped based on filters."""
         filters = self.config.get_filters()
 
-        stars = repo.get('stargazers_count') or 0
+        try:
+            stars = int(repo.get('stargazers_count') or 0)
+        except (ValueError, TypeError):
+            stars = 0
         if stars < self.star_min:
             return True, f"stars_too_few:{stars}"
         if stars > self.star_max:
@@ -146,7 +169,11 @@ class DiscoverStage:
         name = (repo.get('name') or '').lower()
         desc = (repo.get('description') or '').lower()
         text = f"{name} {desc}"
-        for pattern in filters.get('skip_patterns', []):
+        skip_patterns = filters.get('skip_patterns', [])
+        if not isinstance(skip_patterns, list):
+            skip_patterns = []
+        for pattern in skip_patterns:
+            pattern = str(pattern) if pattern is not None else ''
             if not pattern:
                 continue
             pat_lower = pattern.lower()
@@ -162,11 +189,15 @@ class DiscoverStage:
 
         # Check required filters from config
         required = filters.get('required', {})
-        if required.get('has_code') and (repo.get('size') or 0) == 0:
+        try:
+            size = int(repo.get('size') or 0)
+        except (ValueError, TypeError):
+            size = 0
+        if _to_bool(required.get('has_code')) and size == 0:
             return True, "empty_repo"
 
         # Proxy for has_readme: GitHub usually populates description from README
-        if required.get('has_readme') and not repo.get('description'):
+        if _to_bool(required.get('has_readme')) and not repo.get('description'):
             return True, "no_readme"
 
         return False, ""
@@ -174,9 +205,8 @@ class DiscoverStage:
     def _upsert_project(self, repo: Dict, source: str, signal: str, conn=None):
         """Insert or update project in database.
 
-        Uses the provided connection if available; otherwise opens and closes
-        its own.  Does NOT commit — the caller is responsible for committing
-        the transaction.
+        Uses the provided connection if available; otherwise opens its own,
+        commits, and closes.
         """
         should_close = conn is None
         conn = conn or self.db.get_conn()
@@ -203,15 +233,18 @@ class DiscoverStage:
                     reset_status = old_status
                     reset_filter_reason = old_filter_reason
                 elif old_status == 'filtered_skip':
-                    metadata_changed = old_topics != new_topics or old_desc != new_desc
-                    reset_status = 'discovered' if metadata_changed else 'filtered_skip'
-                    reset_filter_reason = None if metadata_changed else old_filter_reason
+                    # Project has passed current discovery filters;
+                    # always reset so semantic filtering can re-evaluate
+                    reset_status = 'discovered'
+                    reset_filter_reason = None
                 else:
                     reset_status = 'discovered'
                     reset_filter_reason = None
             else:
                 reset_status = 'discovered'
                 reset_filter_reason = None
+
+            category = self.config.get_category().name
 
             # Insert or update project
             conn.execute('''
@@ -229,13 +262,16 @@ class DiscoverStage:
                     prev_open_issues = projects.open_issues,
                     open_issues = excluded.open_issues,
                     forks = excluded.forks,
+                    created_at = COALESCE(projects.created_at, excluded.created_at),
+                    first_commit_at = COALESCE(projects.first_commit_at, excluded.first_commit_at),
                     last_commit_at = excluded.last_commit_at,
                     topics = excluded.topics,
                     description = excluded.description,
+                    category = excluded.category,
                     source = excluded.source,
                     filter_reason = excluded.filter_reason,
                     last_fetched_at = excluded.last_fetched_at,
-                    first_seen_at = COALESCE(projects.first_seen_at, excluded.first_seen_at),
+                    first_seen_at = COALESCE(NULLIF(projects.first_seen_at, ''), excluded.first_seen_at),
                     status = CASE
                         WHEN projects.status IN ('active', 'scheduled', 'analyzing')
                             THEN projects.status
@@ -254,13 +290,16 @@ class DiscoverStage:
                 repo.get('pushed_at'),
                 new_topics,
                 new_desc,
-                'ai',
+                category,
                 source,
                 reset_status,
                 reset_filter_reason,
                 now,
                 now
             ))
+
+            if should_close:
+                conn.commit()
 
             return project_id
         finally:
@@ -284,7 +323,10 @@ class DiscoverStage:
             if not proj:
                 return
 
-            current_stars = proj['stars'] or 0
+            try:
+                current_stars = int(proj['stars']) if proj['stars'] is not None else 0
+            except (ValueError, TypeError):
+                current_stars = 0
 
             # Get star history from shared conn if available, else new conn
             if should_close:
@@ -309,17 +351,21 @@ class DiscoverStage:
                 sampled_at = sample.get('sampled_at')
                 if not sampled_at:
                     continue
-                sample_date = datetime.fromisoformat(sampled_at).date()
+                sample_date = datetime.fromisoformat(sampled_at.replace('Z', '+00:00')).date()
                 days_ago = (now.date() - sample_date).days
 
-                if 6 <= days_ago <= 8 and stars_7d_ago is None:
-                    stars_7d_ago = sample['stars']
-                if 13 <= days_ago <= 15 and stars_14d_ago is None:
-                    stars_14d_ago = sample['stars']
-                if 20 <= days_ago <= 22 and stars_21d_ago is None:
-                    stars_21d_ago = sample['stars']
-                if 28 <= days_ago <= 32 and stars_30d_ago is None:
-                    stars_30d_ago = sample['stars']
+                try:
+                    sample_stars = int(sample['stars']) if sample.get('stars') is not None else None
+                except (ValueError, TypeError):
+                    sample_stars = None
+                if 6 <= days_ago <= 8 and stars_7d_ago is None and sample_stars is not None:
+                    stars_7d_ago = sample_stars
+                if 13 <= days_ago <= 15 and stars_14d_ago is None and sample_stars is not None:
+                    stars_14d_ago = sample_stars
+                if 20 <= days_ago <= 22 and stars_21d_ago is None and sample_stars is not None:
+                    stars_21d_ago = sample_stars
+                if 28 <= days_ago <= 32 and stars_30d_ago is None and sample_stars is not None:
+                    stars_30d_ago = sample_stars
 
             # Calculate scores (acceleration-aware when 14d+ data exists)
             velocity_score = self.scoring.calculate_star_velocity(
@@ -331,7 +377,10 @@ class DiscoverStage:
             if last_commit:
                 try:
                     last_dt = datetime.fromisoformat(last_commit.replace('Z', '+00:00'))
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
                     days = (datetime.now(timezone.utc) - last_dt).days
+                    days = max(days, 0)
                     if days <= 7:
                         commit_frequency = 5.0
                     elif days <= 30:
@@ -340,8 +389,12 @@ class DiscoverStage:
                         commit_frequency = 0.5
                 except (ValueError, TypeError):
                     pass
+            try:
+                open_issues = int(proj['open_issues']) if proj['open_issues'] is not None else 0
+            except (ValueError, TypeError):
+                open_issues = 0
             activity_score = self.scoring.calculate_activity_index(
-                proj['open_issues'] or 0, commit_frequency
+                open_issues, commit_frequency
             )
             novelty_score = self.scoring.calculate_novelty(
                 proj['first_commit_at'] or proj['created_at'], 1
@@ -371,6 +424,8 @@ class DiscoverStage:
                 result['is_early_burst'],
                 json.dumps({
                     'stars_7d_ago': stars_7d_ago,
+                    'stars_14d_ago': stars_14d_ago,
+                    'stars_21d_ago': stars_21d_ago,
                     'stars_30d_ago': stars_30d_ago,
                     'current_stars': current_stars
                 })
@@ -385,14 +440,20 @@ class DiscoverStage:
     def discover_topics(self) -> List[Dict]:
         """Discover from GitHub topics."""
         results = []
-        topics = self.config.get_github_topics()
+        topics = [str(t) for t in self.config.get_github_topics() if t]
         languages = self.config.load().get('sources', {}).get('github', {}).get('languages', [])
+        if not isinstance(languages, list):
+            languages = []
+        languages = [str(l) for l in languages if l]
 
         print(f"Discovering from {len(topics)} topics x {len(languages)} languages...")
 
         for topic in topics:
             for lang in languages:
-                query = f"topic:{topic} language:{lang} stars:{self.star_min}..{self.star_max}"
+                # Quote topic/lang if they contain spaces for valid GitHub search syntax
+                safe_topic = f'"{topic}"' if ' ' in topic else topic
+                safe_lang = f'"{lang}"' if ' ' in lang else lang
+                query = f"topic:{safe_topic} language:{safe_lang} stars:{self.star_min}..{self.star_max}"
                 url = "https://api.github.com/search/repositories"
 
                 try:
@@ -402,7 +463,13 @@ class DiscoverStage:
                         print(f"  Unexpected search response type: {type(data)}")
                         continue
 
-                    for repo in (data.get('items') or []):
+                    items = data.get('items')
+                    if not isinstance(items, list):
+                        print(f"  Unexpected items type: {type(items)}")
+                        continue
+                    for repo in items:
+                        if not isinstance(repo, dict):
+                            continue
                         skip, reason = self._should_skip_repo(repo)
                         if not skip:
                             results.append({
@@ -422,14 +489,14 @@ class DiscoverStage:
     def discover_ecosystems(self) -> List[Dict]:
         """Discover from ecosystem organizations."""
         results = []
-        ecosystems = self.config.get_ecosystems()
+        ecosystems = [str(e) for e in self.config.get_ecosystems() if e]
 
         print(f"Discovering from {len(ecosystems)} ecosystems...")
 
         for org in ecosystems:
             page = 1
             while page <= 5:
-                url = f"https://api.github.com/orgs/{org}/repos"
+                url = f"https://api.github.com/orgs/{quote(org, safe='')}/repos"
                 params = {"per_page": 100, "page": page, "sort": "updated"}
 
                 try:
@@ -443,7 +510,12 @@ class DiscoverStage:
                         break
 
                     for repo in repos:
-                        stars = repo.get('stargazers_count') or 0
+                        if not isinstance(repo, dict):
+                            continue
+                        try:
+                            stars = int(repo.get('stargazers_count') or 0)
+                        except (ValueError, TypeError):
+                            stars = 0
                         if stars < self.star_min or stars > self.star_max:
                             continue
 
@@ -468,7 +540,13 @@ class DiscoverStage:
         cfg = self.config.load()
         trending_cfg = cfg.get('sources', {}).get('trending', {})
         languages = trending_cfg.get('languages', [])
+        if not isinstance(languages, list):
+            languages = []
+        languages = [str(l) for l in languages if l]
         periods = trending_cfg.get('periods', ['daily', 'weekly'])
+        if not isinstance(periods, list):
+            periods = ['daily', 'weekly']
+        periods = [str(p) for p in periods if p]
 
         # GitHub non-repo path prefixes to filter out navigation links
         _NON_REPO_PREFIXES = {
@@ -476,6 +554,7 @@ class DiscoverStage:
             "notifications", "issues", "pulls", "sponsors", "about", "pricing",
             "enterprise", "topics", "collections", "events", "apps", "contact",
             "security", "organizations", "new", "codespaces", "copilot", "orgs", "users",
+            "trending",
         }
         # Common web asset extensions that are never repositories
         _ASSET_EXTENSIONS = {
@@ -491,11 +570,12 @@ class DiscoverStage:
                     r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
                     r.raise_for_status()
                     raw = re.findall(
-                        r'href=[\'"]/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)[\'"]', r.text
+                        r'href\s*=\s*[\'"]/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)[\'"]', r.text
                     )
-                    seen: set[str] = set()
-                    repo_names: list[str] = []
+                    seen: Set[str] = set()
+                    repo_names: List[str] = []
                     for full_name in raw:
+                        full_name = full_name.lower()
                         if full_name in seen:
                             continue
                         seen.add(full_name)
@@ -562,14 +642,16 @@ class DiscoverStage:
         all_results.extend(trending_results)
         print(f"  Found: {len(trending_results)} projects")
 
-        # Deduplicate
+        # Deduplicate (case-insensitive to avoid owner/repo casing mismatches)
         seen: Set[str] = set()
         unique_results = []
         for item in all_results:
             pid = (item.get('repo') or {}).get('full_name')
-            if pid and pid not in seen:
-                seen.add(pid)
-                unique_results.append(item)
+            if pid:
+                pid_lower = pid.lower()
+                if pid_lower not in seen:
+                    seen.add(pid_lower)
+                    unique_results.append(item)
 
         print(f"\nTotal unique projects: {len(unique_results)}")
 
@@ -617,7 +699,11 @@ class DiscoverStage:
             sampled = 0
             for proj in active_projects:
                 try:
-                    self._sample_star_count(proj['id'], proj['stars'] or 0, conn=conn)
+                    try:
+                        proj_stars = int(proj['stars']) if proj['stars'] is not None else 0
+                    except (ValueError, TypeError):
+                        proj_stars = 0
+                    self._sample_star_count(proj['id'], proj_stars, conn=conn)
                     self._calculate_and_store_burst_score(proj['id'], conn=conn)
                     sampled += 1
                 except Exception as e:

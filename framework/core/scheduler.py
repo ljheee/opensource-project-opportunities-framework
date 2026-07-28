@@ -43,19 +43,28 @@ class Scheduler:
                     AND t.task_type = 'bulk'
                     AND t.status IN ('pending', 'running')
                 )
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks t
+                    WHERE t.project_id = p.id
+                    AND t.status IN ('pending', 'running')
+                )
                 ORDER BY burst_score DESC, p.stars DESC, p.id ASC
                 LIMIT ?
             ''', (batch_size,))
 
             count = 0
             for row in cur.fetchall():
-                conn.execute('''
-                    INSERT INTO tasks (project_id, task_date, task_type,
-                        priority_score, trigger_reason, status, created_at)
-                    VALUES (?, ?, 'bulk', ?, 'backlog_processing', 'pending', ?)
-                ''', (row['id'], date, row['burst_score'],
-                      datetime.now(timezone.utc).isoformat()))
-                count += 1
+                try:
+                    conn.execute('''
+                        INSERT INTO tasks (project_id, task_date, task_type,
+                            priority_score, trigger_reason, status, created_at)
+                        VALUES (?, ?, 'bulk', ?, 'backlog_processing', 'pending', ?)
+                    ''', (row['id'], date, row['burst_score'],
+                          datetime.now(timezone.utc).isoformat()))
+                    count += 1
+                except sqlite3.IntegrityError:
+                    # Another process inserted the same task concurrently
+                    continue
 
             conn.commit()
             return count
@@ -93,13 +102,17 @@ class Scheduler:
 
             count = 0
             for row in cur.fetchall():
-                conn.execute('''
-                    INSERT INTO tasks (project_id, task_date, task_type,
-                        priority_score, trigger_reason, status, created_at)
-                    VALUES (?, ?, 'incremental', ?, 'new_discovery', 'pending', ?)
-                ''', (row['id'], date, row['burst_score'],
-                      datetime.now(timezone.utc).isoformat()))
-                count += 1
+                try:
+                    conn.execute('''
+                        INSERT INTO tasks (project_id, task_date, task_type,
+                            priority_score, trigger_reason, status, created_at)
+                        VALUES (?, ?, 'incremental', ?, 'new_discovery', 'pending', ?)
+                    ''', (row['id'], date, row['burst_score'],
+                          datetime.now(timezone.utc).isoformat()))
+                    count += 1
+                except sqlite3.IntegrityError:
+                    # Another process inserted the same task concurrently
+                    continue
 
             conn.commit()
             return count
@@ -107,16 +120,16 @@ class Scheduler:
             conn.close()
 
     def mark_task_running(self, task_id: int, conn=None):
-        """Mark a task as running."""
+        """Mark a task as running (only if currently pending)."""
         should_close = conn is None
         conn = conn or self.get_conn()
         try:
             cursor = conn.execute("""
                 UPDATE tasks SET status = 'running', started_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'pending'
             """, (datetime.now(timezone.utc).isoformat(), task_id))
             if cursor.rowcount == 0:
-                raise ValueError(f"Task {task_id} not found or already running")
+                raise ValueError(f"Task {task_id} not found or not pending")
             if should_close:
                 conn.commit()
         finally:
@@ -124,16 +137,16 @@ class Scheduler:
                 conn.close()
 
     def mark_task_done(self, task_id: int, opportunities_found: int = 0, conn=None):
-        """Mark a task as completed."""
+        """Mark a task as completed (only if currently running)."""
         should_close = conn is None
         conn = conn or self.get_conn()
         try:
             cursor = conn.execute("""
                 UPDATE tasks SET status = 'done', finished_at = ?, opportunities_found = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'running'
             """, (datetime.now(timezone.utc).isoformat(), opportunities_found, task_id))
             if cursor.rowcount == 0:
-                raise ValueError(f"Task {task_id} not found")
+                raise ValueError(f"Task {task_id} not found or not running")
             if should_close:
                 conn.commit()
         finally:
@@ -141,16 +154,16 @@ class Scheduler:
                 conn.close()
 
     def mark_task_failed(self, task_id: int, error_message: str = None, conn=None):
-        """Mark a task as failed."""
+        """Mark a task as failed (only if currently running)."""
         should_close = conn is None
         conn = conn or self.get_conn()
         try:
             cursor = conn.execute("""
                 UPDATE tasks SET status = 'failed', finished_at = ?, trigger_reason = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'running'
             """, (datetime.now(timezone.utc).isoformat(), error_message or 'analysis_failed', task_id))
             if cursor.rowcount == 0:
-                raise ValueError(f"Task {task_id} not found")
+                raise ValueError(f"Task {task_id} not found or not running")
             if should_close:
                 conn.commit()
         finally:

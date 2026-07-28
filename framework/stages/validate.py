@@ -14,9 +14,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from framework.core.db import Database
 
 
-def _predicted_growth(overall_score: float) -> float:
+def _predicted_growth(overall_score) -> float:
     """Compute expected daily star growth from an overall score."""
-    return max((overall_score or 0) * 8, 1)
+    try:
+        score = float(overall_score) if overall_score is not None else 0.0
+    except (ValueError, TypeError):
+        score = 0.0
+    return max(score * 8, 1)
 
 
 def record_new_predictions(db: Database):
@@ -90,9 +94,19 @@ def check_pending_outcomes(db: Database, min_days: int = 7):
 
         updated = 0
         for row in cur.fetchall():
-            stars_then = row['stars_at_prediction'] or 0
-            stars_now = row['stars_now'] or 0
-            days = max(row['days_elapsed'] or min_days, 1)
+            try:
+                stars_then = int(row['stars_at_prediction']) if row['stars_at_prediction'] is not None else 0
+            except (ValueError, TypeError):
+                stars_then = 0
+            try:
+                stars_now = int(row['stars_now']) if row['stars_now'] is not None else 0
+            except (ValueError, TypeError):
+                stars_now = 0
+            try:
+                days_elapsed = int(row['days_elapsed']) if row['days_elapsed'] is not None else min_days
+            except (ValueError, TypeError):
+                days_elapsed = min_days
+            days = max(days_elapsed, 1)
 
             # Actual growth rate per day
             try:
@@ -101,7 +115,11 @@ def check_pending_outcomes(db: Database, min_days: int = 7):
                 actual_growth = 0.0
 
             # Predicted trajectory: overall_score maps roughly to expected growth
-            predicted_growth = row['growth_rate_predicted'] or _predicted_growth(row['overall_score_at_prediction'])
+            try:
+                pred_growth = float(row['growth_rate_predicted']) if row['growth_rate_predicted'] is not None else None
+            except (ValueError, TypeError):
+                pred_growth = None
+            predicted_growth = pred_growth if pred_growth is not None else _predicted_growth(row['overall_score_at_prediction'])
 
             # Fast-path: star decline or zero growth is always false positive
             if stars_now <= stars_then:
@@ -133,21 +151,30 @@ def print_metrics(db: Database):
     """Print validation metrics to stdout."""
     conn = db.get_conn()
     try:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome != 'pending'"
-        ).fetchone()[0]
-
-        tp = conn.execute(
-            "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'true_positive'"
-        ).fetchone()[0]
-
-        fp = conn.execute(
-            "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'false_positive'"
-        ).fetchone()[0]
-
-        pending = conn.execute(
-            "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'pending'"
-        ).fetchone()[0]
+        try:
+            total = int(conn.execute(
+                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome IN ('true_positive', 'false_positive')"
+            ).fetchone()[0] or 0)
+        except (ValueError, TypeError):
+            total = 0
+        try:
+            tp = int(conn.execute(
+                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'true_positive'"
+            ).fetchone()[0] or 0)
+        except (ValueError, TypeError):
+            tp = 0
+        try:
+            fp = int(conn.execute(
+                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'false_positive'"
+            ).fetchone()[0] or 0)
+        except (ValueError, TypeError):
+            fp = 0
+        try:
+            pending = int(conn.execute(
+                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'pending'"
+            ).fetchone()[0] or 0)
+        except (ValueError, TypeError):
+            pending = 0
 
         print("\n=== Prediction Validation Metrics ===")
         print(f"Total evaluated: {total}  (TP: {tp}, FP: {fp})")
@@ -157,15 +184,20 @@ def print_metrics(db: Database):
             precision = tp / total
             print(f"Precision (7d+ horizon): {precision:.2%}")
 
-            avg_tp = conn.execute('''
-                SELECT AVG(growth_rate_actual) FROM prediction_outcomes
-                WHERE outcome = 'true_positive'
-            ''').fetchone()[0] or 0
-
-            avg_fp = conn.execute('''
-                SELECT AVG(growth_rate_actual) FROM prediction_outcomes
-                WHERE outcome = 'false_positive'
-            ''').fetchone()[0] or 0
+            try:
+                avg_tp = float(conn.execute('''
+                    SELECT AVG(growth_rate_actual) FROM prediction_outcomes
+                    WHERE outcome = 'true_positive'
+                ''').fetchone()[0] or 0)
+            except (ValueError, TypeError):
+                avg_tp = 0.0
+            try:
+                avg_fp = float(conn.execute('''
+                    SELECT AVG(growth_rate_actual) FROM prediction_outcomes
+                    WHERE outcome = 'false_positive'
+                ''').fetchone()[0] or 0)
+            except (ValueError, TypeError):
+                avg_fp = 0.0
 
             print(f"Avg actual growth — TP: {avg_tp:.1f} stars/day, FP: {avg_fp:.1f} stars/day")
 
@@ -182,14 +214,22 @@ def print_metrics(db: Database):
                 COUNT(*) as total,
                 SUM(CASE WHEN outcome = 'true_positive' THEN 1 ELSE 0 END) as tp_count
             FROM prediction_outcomes
-            WHERE outcome != 'pending'
+            WHERE outcome IN ('true_positive', 'false_positive')
             GROUP BY bucket
             ORDER BY MIN(overall_score_at_prediction) DESC
         ''').fetchall()
 
         for b in buckets:
-            prec = b['tp_count'] / b['total'] if b['total'] > 0 else 0
-            print(f"  {b['bucket']}: {b['total']} eval, precision {prec:.0%}")
+            try:
+                b_total = int(b['total']) if b['total'] is not None else 0
+            except (ValueError, TypeError):
+                b_total = 0
+            try:
+                b_tp = int(b['tp_count']) if b['tp_count'] is not None else 0
+            except (ValueError, TypeError):
+                b_tp = 0
+            prec = b_tp / b_total if b_total > 0 else 0
+            print(f"  {b['bucket']}: {b_total} eval, precision {prec:.0%}")
     finally:
         conn.close()
 
@@ -201,6 +241,10 @@ def main():
     parser.add_argument('--metrics-only', action='store_true',
                         help="Only print metrics, do not update")
     args = parser.parse_args()
+
+    if args.min_days < 0:
+        print("ERROR: min-days must be non-negative")
+        sys.exit(1)
 
     db = Database()
 

@@ -70,8 +70,6 @@ early_burst:
       weight: 0.25
       thresholds:
         default_score: 0.3
-        hn_mentions: 1
-        reddit_mentions: 2
     novelty_signal:
       weight: 0.15
       thresholds:
@@ -82,7 +80,6 @@ filters:
   required:
     has_readme: true
     has_code: true
-    min_contributors: 1
   skip_patterns:
     - "awesome"
     - "tutorial"
@@ -137,15 +134,6 @@ filters:
       - "library"
       - "framework"
 
-anchors:
-  - "rag"
-  - "agent"
-  - "diffusion"
-  - "langchain"
-  - "ollama"
-  - "code-generation"
-  - "voice-ai"
-
 scheduling:
   bulk:
     batch_size: 20
@@ -157,10 +145,6 @@ resilience:
   github_api:
     max_retries: 3
     retry_delay_seconds: 60
-    rate_limit_wait_seconds: 3600
   llm_analysis:
     max_retries: 2
     timeout_seconds: 300
-  star_history:
-    sample_interval_days: 1
-    min_samples_for_velocity: 3
