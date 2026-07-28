@@ -368,17 +368,23 @@ class DiscoverStage:
     def _backfill_star_history(self, project_id: str, stars: int, conn=None) -> int:
         """Rebuild daily star history from stargazer timestamps (first-seen projects).
 
-        Returns number of synthetic rows written. Skips entirely if the project
-        already has star_history rows. Synthetic rows use 'YYYY-MM-DD' dates to
+        Returns number of synthetic rows written. Skips when the project already
+        has >= 7 star_history samples (a full velocity window of real depth, or a
+        previous backfill). Skips also when rows span >= 3 distinct dates, which
+        marks a completed backfill even when it produced fewer than 7 rows (stars
+        concentrated on few days); legacy projects carry a single early sample on
+        one date, so they still backfill. Synthetic rows use 'YYYY-MM-DD' dates to
         match db.sample_star_count's date(?) format and UNIQUE(project_id, sampled_at).
         """
         should_close = conn is None
         conn = conn or self.db.get_conn()
         try:
-            existing = conn.execute(
-                'SELECT 1 FROM star_history WHERE project_id = ? LIMIT 1', (project_id,)
+            row = conn.execute(
+                'SELECT COUNT(*) AS c, COUNT(DISTINCT sampled_at) AS d '
+                'FROM star_history WHERE project_id = ?',
+                (project_id,)
             ).fetchone()
-            if existing:
+            if row['c'] >= 7 or row['d'] >= 3:
                 return 0
             timestamps = self._fetch_stargazer_timestamps(project_id, stars)
             if not timestamps:
