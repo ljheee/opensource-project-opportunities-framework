@@ -74,6 +74,20 @@ class Scheduler:
     def generate_incremental_tasks(self, date: str, max_tasks: int) -> int:
         if max_tasks <= 0:
             return 0
+        inc = (self.config or {}).get('incremental') or {}
+        try:
+            star_threshold = float(inc.get('star_change_threshold', 0.05))
+        except (ValueError, TypeError):
+            star_threshold = 0.05
+        try:
+            recent_commit_days = int(inc.get('recent_commit_days', 3))
+        except (ValueError, TypeError):
+            recent_commit_days = 3
+        try:
+            cooldown_days = int(inc.get('min_reanalyze_days', 7))
+        except (ValueError, TypeError):
+            cooldown_days = 7
+
         conn = self.get_conn()
         try:
             cur = conn.execute('''
@@ -96,9 +110,37 @@ class Scheduler:
                     WHERE t.project_id = p.id
                     AND t.status IN ('pending', 'running')
                 )
+                AND (
+                    -- Never analyzed: always eligible
+                    NOT EXISTS (SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.status = 'done')
+                    OR (
+                        -- Cooldown elapsed since last analysis.
+                        -- datetime() normalizes ISO 'T...+00:00' to SQLite 'YYYY-MM-DD HH:MM:SS';
+                        -- COALESCE prevents starvation when a done task exists but analyses rows are gone.
+                        COALESCE(
+                            datetime((SELECT MAX(a.analyzed_at) FROM analyses a WHERE a.project_id = p.id)),
+                            '1970-01-01'
+                        ) <= datetime('now', '-' || ? || ' days')
+                        AND (
+                            -- 7-day star growth >= threshold (unknown history -> not satisfied)
+                            (
+                                SELECT CASE WHEN h.old_stars > 0
+                                       THEN (CAST(p.stars AS REAL) - h.old_stars) / h.old_stars
+                                       ELSE 0 END
+                                FROM (
+                                    SELECT stars as old_stars FROM star_history
+                                    WHERE project_id = p.id
+                                      AND sampled_at <= date('now', '-7 days')
+                                    ORDER BY sampled_at DESC LIMIT 1
+                                ) h
+                            ) >= ?
+                            OR datetime(p.last_commit_at) >= datetime('now', '-' || ? || ' days')
+                        )
+                    )
+                )
                 ORDER BY burst_score DESC, p.stars DESC, p.id ASC
                 LIMIT ?
-            ''', (date, max_tasks))
+            ''', (date, cooldown_days, star_threshold, recent_commit_days, max_tasks))
 
             count = 0
             for row in cur.fetchall():
