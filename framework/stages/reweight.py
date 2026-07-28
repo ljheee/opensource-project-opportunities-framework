@@ -17,11 +17,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from framework.core.db import Database
 
-COMPONENTS = ['star_velocity', 'activity_index', 'community_buzz', 'novelty_signal']
+COMPONENTS = ['star_velocity', 'activity_index', 'novelty_signal']
 COMPONENT_COLS = {
     'star_velocity': 'star_velocity_at_pred',
     'activity_index': 'activity_index_at_pred',
-    'community_buzz': 'community_buzz_at_pred',
     'novelty_signal': 'novelty_at_pred',
 }
 
@@ -226,11 +225,9 @@ def backtest(rows, new_weights, new_min_score):
     tp_new = 0
     fp_new = 0
     for r in rows:
-        new_score = (
-            (r['star_velocity_at_pred'] or 0) * new_weights['star_velocity'] +
-            (r['activity_index_at_pred'] or 0) * new_weights['activity_index'] +
-            (r['community_buzz_at_pred'] or 0) * new_weights['community_buzz'] +
-            (r['novelty_at_pred'] or 0) * new_weights['novelty_signal']
+        new_score = sum(
+            (r.get(COMPONENT_COLS[c]) or 0) * new_weights.get(c, 0)
+            for c in COMPONENTS
         )
         predicted_burst = new_score >= new_min_score
         actual_positive = r['outcome'] == 'true_positive'
