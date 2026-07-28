@@ -86,6 +86,18 @@ class ReportGenerator:
                 ).fetchone()[0] or 0)
             except (ValueError, TypeError):
                 fp_count = 0
+            try:
+                fn_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'false_negative'"
+                ).fetchone()[0] or 0)
+            except (ValueError, TypeError):
+                fn_count = 0
+            try:
+                tn_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'true_negative'"
+                ).fetchone()[0] or 0)
+            except (ValueError, TypeError):
+                tn_count = 0
 
             # Tech stack distribution (latest analysis per project only)
             tech_distribution = conn.execute('''
@@ -141,40 +153,45 @@ class ReportGenerator:
                 "",
             ]
 
-            if total_evaluated > 0:
-                precision = tp_count / total_evaluated
-                try:
-                    avg_tp = float(conn.execute('''
-                        SELECT AVG(growth_rate_actual) FROM prediction_outcomes
-                        WHERE outcome = 'true_positive'
-                    ''').fetchone()[0] or 0)
-                except (ValueError, TypeError):
-                    avg_tp = 0.0
-                try:
-                    avg_fp = float(conn.execute('''
-                        SELECT AVG(growth_rate_actual) FROM prediction_outcomes
-                        WHERE outcome = 'false_positive'
-                    ''').fetchone()[0] or 0)
-                except (ValueError, TypeError):
-                    avg_fp = 0.0
-                try:
-                    avg_pred_tp = float(conn.execute('''
-                        SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
-                        WHERE outcome = 'true_positive'
-                    ''').fetchone()[0] or 0)
-                except (ValueError, TypeError):
-                    avg_pred_tp = 0.0
-                try:
-                    avg_pred_fp = float(conn.execute('''
-                        SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
-                        WHERE outcome = 'false_positive'
-                    ''').fetchone()[0] or 0)
-                except (ValueError, TypeError):
-                    avg_pred_fp = 0.0
-                lines.append(f"- **Predictions evaluated:** {total_evaluated} (TP: {tp_count}, FP: {fp_count})")
-                lines.append(f"- **Precision (7d+ horizon):** {precision:.1%}")
-                lines.append(f"- **Avg actual growth — TP:** {avg_tp:.1f} stars/day, FP: {avg_fp:.1f} stars/day")
-                lines.append(f"- **Avg predicted growth — TP:** {avg_pred_tp:.1f} stars/day, FP: {avg_pred_fp:.1f} stars/day")
+            if total_evaluated > 0 or (fn_count + tn_count) > 0:
+                if total_evaluated > 0:
+                    precision = tp_count / total_evaluated
+                    try:
+                        avg_tp = float(conn.execute('''
+                            SELECT AVG(growth_rate_actual) FROM prediction_outcomes
+                            WHERE outcome = 'true_positive'
+                        ''').fetchone()[0] or 0)
+                    except (ValueError, TypeError):
+                        avg_tp = 0.0
+                    try:
+                        avg_fp = float(conn.execute('''
+                            SELECT AVG(growth_rate_actual) FROM prediction_outcomes
+                            WHERE outcome = 'false_positive'
+                        ''').fetchone()[0] or 0)
+                    except (ValueError, TypeError):
+                        avg_fp = 0.0
+                    try:
+                        avg_pred_tp = float(conn.execute('''
+                            SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
+                            WHERE outcome = 'true_positive'
+                        ''').fetchone()[0] or 0)
+                    except (ValueError, TypeError):
+                        avg_pred_tp = 0.0
+                    try:
+                        avg_pred_fp = float(conn.execute('''
+                            SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
+                            WHERE outcome = 'false_positive'
+                        ''').fetchone()[0] or 0)
+                    except (ValueError, TypeError):
+                        avg_pred_fp = 0.0
+                    lines.append(f"- **Predictions evaluated:** {total_evaluated} (TP: {tp_count}, FP: {fp_count})")
+                    lines.append(f"- **Precision (7d+ horizon):** {precision:.1%}")
+                    lines.append(f"- **Avg actual growth — TP:** {avg_tp:.1f} stars/day, FP: {avg_fp:.1f} stars/day")
+                    lines.append(f"- **Avg predicted growth — TP:** {avg_pred_tp:.1f} stars/day, FP: {avg_pred_fp:.1f} stars/day")
+                lines.append(f"- **Missed bursts (FN):** {fn_count} | **Correctly passed (TN):** {tn_count}")
+                if tp_count + fn_count > 0:
+                    recall = tp_count / (tp_count + fn_count)
+                    lines.append(f"- **Recall (trending-source):** {recall:.1%}")
 
                 # Score bucket calibration table
                 buckets = conn.execute('''
