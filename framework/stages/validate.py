@@ -104,8 +104,9 @@ def record_new_predictions(db: Database, min_days_for_fn: int = 7):
         for row in fn_cur.fetchall():
             baseline = conn.execute('''
                 SELECT stars FROM star_history
-                WHERE project_id = ? ORDER BY sampled_at ASC LIMIT 1
-            ''', (row['project_id'],)).fetchone()
+                WHERE project_id = ? AND sampled_at <= date(?)
+                ORDER BY sampled_at DESC LIMIT 1
+            ''', (row['project_id'], row['first_seen_at'])).fetchone()
             baseline_stars = baseline['stars'] if baseline else row['stars']
             # 无星史样本时基线是当前 stars，checked_at 记首次发现日（spec §2.4-2）
             if baseline:
@@ -194,8 +195,9 @@ def check_pending_outcomes(db: Database, min_days: int = 7):
                 else:
                     outcome = 'false_positive'
             else:
-                # FN 候选：实际增速超过固定阈值 = 我们漏掉的爆发
-                if actual_growth >= _fn_threshold():
+                # FN 候选：实际增速超过记录时固化的阈值（growth_rate_predicted）
+                # = 我们漏掉的爆发；不读 live min_score，避免 reweight 后阈值漂移。
+                if actual_growth >= predicted_growth:
                     outcome = 'false_negative'
                 else:
                     outcome = 'true_negative'
@@ -284,9 +286,15 @@ def print_metrics(db: Database):
 
             print(f"Avg actual growth — TP: {avg_tp:.1f} stars/day, FP: {avg_fp:.1f} stars/day")
 
-        print(f"Recall candidates — FN (missed bursts): {fn}, TN: {tn}")
-        if tp + fn > 0:
-            print(f"Recall (trending-source): {tp / (tp + fn):.2%}")
+        if fn + tn > 0 or tp > 0:
+            tp_trending = int(conn.execute('''
+                SELECT COUNT(*) FROM prediction_outcomes po
+                JOIN projects p ON po.project_id = p.id
+                WHERE po.outcome = 'true_positive' AND p.source = 'trending'
+            ''').fetchone()[0] or 0)
+            print(f"Recall candidates — FN (missed bursts): {fn}, TN: {tn}")
+            if tp_trending + fn > 0:
+                print(f"Recall (trending-source): {tp_trending / (tp_trending + fn):.2%}")
 
         # Score bucket calibration
         print("\n--- Score Bucket Calibration ---")

@@ -189,8 +189,13 @@ class ReportGenerator:
                     lines.append(f"- **Avg actual growth — TP:** {avg_tp:.1f} stars/day, FP: {avg_fp:.1f} stars/day")
                     lines.append(f"- **Avg predicted growth — TP:** {avg_pred_tp:.1f} stars/day, FP: {avg_pred_fp:.1f} stars/day")
                 lines.append(f"- **Missed bursts (FN):** {fn_count} | **Correctly passed (TN):** {tn_count}")
-                if tp_count + fn_count > 0:
-                    recall = tp_count / (tp_count + fn_count)
+                tp_trending = int(conn.execute('''
+                    SELECT COUNT(*) FROM prediction_outcomes po
+                    JOIN projects p ON po.project_id = p.id
+                    WHERE po.outcome = 'true_positive' AND p.source = 'trending'
+                ''').fetchone()[0] or 0)
+                if tp_trending + fn_count > 0:
+                    recall = tp_trending / (tp_trending + fn_count)
                     lines.append(f"- **Recall (trending-source):** {recall:.1%}")
 
                 # Score bucket calibration table
