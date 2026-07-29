@@ -1,76 +1,72 @@
-# Task 5 Report: Contributors 实采（commits API）
+# Task 5 Report: prompt 模板改造与 values 接线
 
-## What I Implemented
+**Status:** DONE
+**Commit:** b511911 `feat: prompt contract for evidence-grounded analysis with injection guards`
+**Branch:** feat/tiered-deep-analysis
 
-Exactly per the brief, in `framework/stages/discover.py`:
+(Note: this file previously contained a stale report from an earlier plan's "Task 5" (contributors sampling); overwritten per current task assignment.)
 
-1. **New method `_fetch_weekly_contributors(full_name) -> Optional[int]`** (inserted after `_backfill_within_budget`, now at discover.py:428): calls `GET /repos/{full_name}/commits?since=<7d ago>&per_page=100` via `_github_request`, dedupes distinct commit authors by `author.login` (lowercased), falling back to `commit.author.email` when the GitHub user object is absent. Returns `None` on `GitHubAPIError` or non-list response; returns the distinct author count otherwise (0 is a valid result). Uses `quote(full_name, safe='/')` verbatim as specified.
+## What I implemented
 
-2. **Scoring integration in `_calculate_and_store_burst_score`** (discover.py:540-551): replaced the hardcoded `calculate_novelty(..., 1)` with: read `proj['contributor_count']`; if NULL, fetch via `_fetch_weekly_contributors(project_id)` and on success UPDATE `projects.contributor_count`; pass the count to `calculate_novelty`, falling back to 1 only when both DB value and fetch are unavailable. `project_id` is the repo full name (same convention as `_fetch_stargazer_timestamps(project_id, ...)`), so the parameter passing is consistent.
+### Step 1: prompt 模板改造 (`framework/prompts/ai_analyze.md`)
 
-## Verification Evidence
+1. Inserted three new input sections BEFORE `## Project README (excerpt)`:
+   - `## Structural Facts (deterministic, from repo tree/manifest/issues)` with `<structural-facts>{structure_facts}</structural-facts>`
+   - `## Core Implementation Excerpts` with `<core-implementation>{core_implementation}</core-implementation>` and PRIMARY-evidence-for-innovation guard
+   - `## Community Signals (top issues)` with `<community-signals>{community_signals}</community-signals>` and PRIMARY-evidence-for-problem guard
+   - All three carry the untrusted-third-party-content injection guard.
+2. Appended instruction 6 (**Evidence discipline**) to the end of `## Analysis Instructions`, verbatim from the brief.
+3. Added four output schema fields after `"overall_score": 1-10,`: `innovation_evidence`, `problem_evidence`, `confidence`, `cannot_determine`.
+4. Appended the four Field Guidelines bullets.
 
-### Step 3 (brief, verbatim)
+### Step 2: values 接线 (`framework/stages/analyze.py`)
+
+1. Added three formatter functions immediately after `_format_prompt` (analyze.py:548-597), exactly per the brief:
+   - `_format_structure_facts` (flags, dependencies capped at 30, matched packages, core_paths + reason, issue_health, partial-tree note)
+   - `_format_core_excerpts` (max 3 excerpts, FOUR-backtick fences so embedded triple-backtick content does not break the fence)
+   - `_format_community_signals` (issue stats + numbered top issues with reactions/comments; distinct fallback when issues disabled/fetch failed)
+2. Wired three values into the `_format_prompt` dict in `generate_analysis_with_llm` right after the `'readme_excerpt'` line:
+   - `'structure_facts': _format_structure_facts(project.get('structure'))`
+   - `'core_implementation': _format_core_excerpts(project.get('core_excerpts'))`
+   - `'community_signals': _format_community_signals(project.get('structure'))`
+
+These consume Task 4's `structure` / `core_excerpts` keys from `get_project_data` (already present in the same file, analyze.py:264-274).
+
+## Verification evidence
+
+Ran the brief's Step 3 command verbatim:
 
 ```
-$ PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 -c "
-from framework.core.config_loader import ConfigLoader
-from framework.core.db import Database
-from framework.stages.discover import DiscoverStage
-s = DiscoverStage(ConfigLoader(), Database())
-n = s._fetch_weekly_contributors('octocat/Hello-World')
-print('octocat/Hello-World weekly contributors:', n)
-assert n is not None
+$ PYTHONPATH=. python3 -c "
+from framework.stages.analyze import _format_prompt, _format_structure_facts, _format_community_signals
+tpl = open('framework/prompts/ai_analyze.md').read()
+s = _format_structure_facts({...})
+c = _format_community_signals({... 'top_issues': [{'title': 'bug {name}', ...}]})
+out = _format_prompt(tpl, {'structure_facts': s, 'core_implementation': 'CODE', 'community_signals': c, 'name': 'REALNAME'})
+assert 'CODE' in out and 'has_tests: True' in out
+assert 'bug REALNAME' not in out and 'bug {name}' in out  # content placeholders NOT replaced
+for ph in ('{structure_facts}', '{core_implementation}', '{community_signals}'):
+    assert ph not in out, ph
+print('prompt wiring OK')
 "
-octocat/Hello-World weekly contributors: 0
+prompt wiring OK
 ```
 
-0 is the valid real result for that repo (no recent commits); assertion passed, exit 0.
+Output: `prompt wiring OK` — all assertions passed, including the single-pass guarantee (content-side `{name}` inside an issue title is NOT substituted) and that all three new template placeholders are fully replaced. The module import itself also serves as a compile check for the new functions.
 
-### Positive-case check (additional, per team-lead instruction)
+## Files changed
 
-```
-$ ... s._fetch_weekly_contributors('huggingface/transformers') ...
-huggingface/transformers weekly contributors: 42
-```
+- `/Users/lijianhua04/Documents/my-agents/catpawDesk-workspace/github-opportunities/opensource-project-opportunities-framework/framework/prompts/ai_analyze.md` (+33)
+- `/Users/lijianhua04/Documents/my-agents/catpawDesk-workspace/github-opportunities/opensource-project-opportunities-framework/framework/stages/analyze.py` (+54)
 
-Integer >= 1, assertion passed, exit 0.
+Commit: `b511911` — exactly the two files staged per Step 4; unrelated working-tree modifications left untouched.
 
-### End-to-end smoke test of the scoring integration (in-memory DB, real API)
+## Self-review findings
 
-Inserted a `huggingface/transformers` row with `contributor_count = NULL` into an in-memory DB (`dbmod.DB_PATH = ':memory:'`), ran `_calculate_and_store_burst_score`:
-
-```
-contributor_count backfilled: 42
-novelty_score: 0.2 overall_score: 0.49250000000000005
-re-fetch calls on second run: 0
-```
-
-- The real fetch result (42) was backfilled into `projects.contributor_count` and used in novelty scoring.
-- Second run with a stubbed `_fetch_weekly_contributors` made **zero** fetch calls — the NULL-only guard works; no repeat API traffic for already-sampled projects.
-
-## Commit
-
-```
-1fe0561 feat: sample real weekly contributors for novelty signal
- framework/stages/discover.py | 38 +++++++++++++++++++++++++++++++++++++-
- 1 file changed, 37 insertions(+), 1 deletion(-)
-```
-
-Only `framework/stages/discover.py` was staged, exactly as Step 4 specifies. Pre-existing unrelated modifications in the working tree (config.yaml, other framework files) were left untouched.
-
-## Files Changed
-
-- `/Users/lijianhua04/Documents/my-agents/catpawDesk-workspace/github-opportunities/opensource-project-opportunities-framework/framework/stages/discover.py` (+37/-1)
-
-## Self-Review Findings
-
-1. **Transaction persistence verified**: in the `should_close` path, the single `conn.commit()` at discover.py:588-589 commits both the `contributor_count` UPDATE and the signals INSERT atomically; in the shared-conn path the caller commits. Neither path loses the backfill.
-2. **Idempotency**: NULL-only fetch means one API call per project ever (unless the first fetch fails, in which case it retries on the next scoring run — desired behavior).
-3. **Failure mode**: on API failure the method returns None, prints a diagnostic, and scoring falls back to contributor count 1 — identical behavior to the pre-change hardcoded value. No regression risk on network errors.
-4. **Redundant `or {}` in `((c.get('author') or {}) or {})`**: kept verbatim from the brief; harmless.
+- Diff reviewed via `git show b511911`; every hunk matches the brief's markdown/python blocks.
+- Minor intentional deviation: the brief's inline comment on the four-backtick fence was in Chinese; I translated it to English (`# Four-backtick fences: file content itself may contain triple backticks (review fix)`) because the entire file is English-only. Semantics unchanged.
+- Formatter functions sit after `_format_prompt` and before `generate_analysis_with_llm`; module-level defs, no ordering hazard.
 
 ## Concerns
 
-1. **Truncation at 100 commits**: `per_page=100` with no pagination means repos with >100 commits in 7 days (e.g. very active monorepos) get contributor counts sampled from only the newest 100 commits. This is inherent to the brief's design and acceptable for a novelty heuristic, but worth noting.
-2. **Stale backfill**: once backfilled, `contributor_count` is never refreshed, so the novelty signal reflects the week of first scoring, not the current week. Again per design (the column doubles as a cache), but a long-lived project's novelty may drift from reality over time.
+- None blocking. Note for Task 6: the four new schema fields (`innovation_evidence`, `problem_evidence`, `confidence`, `cannot_determine`) are requested in the prompt but `validate_analysis_output` does not yet require/normalize them — per the plan that validation belongs to Task 6.

@@ -1,61 +1,69 @@
-# Task 7 Report: validate.py 召回率回溯（FN 算法）
+# Task 7 Report: 评分反哺（buzz 复活 + activity 增强 + reweight 组件表）
 
-## What I Implemented
+> Note: this file previously held a stale report for a different task
+> ("validate.py 召回率回溯 FN 算法"); overwritten per team-lead instruction
+> to write the current Task 7 report here.
 
-All four edits to `framework/stages/validate.py`, exactly per the brief:
+## What I implemented
 
-1. **Step 1** — Added `from datetime import datetime, timezone`, `from framework.core.config_loader import ConfigLoader`, and the `_fn_threshold()` helper (`min_score * 8 * 0.5`, falls back to 0.65 on any exception). Verified `ConfigLoader().get_early_burst_config().min_score` exists (config_loader.py:23,69).
-2. **Step 2** — `record_new_predictions(db, min_days_for_fn: int = 7)`: inserted the FN-candidate block before `conn.commit()`. Subquery SELECT list includes `is_early_burst` (required by the outer filter); outer filter `e.is_early_burst IS NOT 1` matches 0 and NULL. Inserted rows have all four component columns NULL (direction marker) and `growth_rate_predicted = fn_threshold`. `checked_at` = today (UTC) when a star_history baseline exists, else `first_seen_at` date.
-3. **Step 3** — Added `po.star_velocity_at_pred` to the `check_pending_outcomes` SELECT, and replaced the flat TP/FP judgment with the direction branch: `is_tp_candidate = row['star_velocity_at_pred'] is not None`. TP branch = original logic verbatim; FN branch labels `false_negative` when `actual_growth >= _fn_threshold()` else `true_negative`. UPDATE statement unchanged.
-4. **Step 4** — `print_metrics`: added FN/TN counts after the `pending` count, and the recall print lines after the precision block (self-review correction, see below).
+1. **`framework/core/scoring_engine.py`**
+   - Added `calculate_buzz(issue_health: Optional[Dict]) -> float` after `default_buzz_score` (verbatim from brief): None/non-dict -> `default_buzz_score()` fallback; otherwise weighted blend of reaction_total (0.5), active_issues_30d (0.3), avg_comments (0.2) normalized against `community_buzz` thresholds (`reaction_total_full`/`active_issues_full`/`avg_comments_full`, defaults 50/5/5), clamped to [0,1].
+   - Extended `calculate_activity_index` signature with `has_tests=None, has_ci=None`; before `return min(score, 1.0)` added the bonus block (+0.1 when both truthy, +0.05 when one truthy, only when at least one is not None).
 
-## Verification Evidence
+2. **`framework/stages/discover.py`** (`_calculate_and_store_burst_score`)
+   - Inserted the `structure` parsing block immediately after the Task 3 `fresh_facts = self._structure_within_budget(project_id, conn)` line (before the activity call site, per ordering requirement): prefer `fresh_facts`, else parse `proj['structure_json']` with JSONDecodeError/TypeError guard.
+   - Activity call site now passes `has_tests=(structure or {}).get('has_tests')`, `has_ci=(structure or {}).get('has_ci')`.
+   - Buzz call site replaced `default_buzz_score()` with `issue_health = (structure or {}).get('issue_health'); buzz_score = self.scoring.calculate_buzz(issue_health); buzz_source = 'real' if issue_health else 'fallback'`.
+   - Added `'buzz_source': buzz_source,` to the signals_json dict.
 
-### Step 5 constructed-data test (verbatim from brief, /tmp/fn_test.db)
+3. **`framework/stages/reweight.py:20-26`**
+   - Restored `community_buzz` in `COMPONENTS` and added `'community_buzz': 'community_buzz_at_pred'` to `COMPONENT_COLS`. Verified the column exists: `framework/core/db.py:65` migrates it via `_add_column_if_missing` and `:306` includes it in the table DDL; validate.py already writes it; reweight.py:65/76 already selected/read it.
 
-```
-Recorded 1 new FN candidates
-Recorded 0 new predictions
-Updated 1 pending outcomes
-{'id': 1, 'project_id': 'a/b', 'predicted_at': '2026-07-18 13:43:21', 'stars_at_prediction': 100,
- 'overall_score_at_prediction': 0.4, 'star_velocity_at_pred': None, 'activity_index_at_pred': None,
- 'community_buzz_at_pred': None, 'novelty_at_pred': None, 'growth_rate_predicted': 2.6,
- 'checked_at': '2026-07-28', 'stars_now': 500, 'growth_rate_actual': 40.0, 'outcome': 'false_negative'}
-FN pipeline OK
-```
+## TDD evidence
 
-Growth = (500-100)/10 = 40 stars/day >= 2.6 → `false_negative`. Component columns NULL as designed. Passed on first run (no date-boundary adjustment needed).
-
-### TP-direction regression sanity check (my own, /tmp/fn_tp_test.db)
-
-Early-burst project (score 0.80, components 0.9/0.8/0.7/0.8), 100 stars at record time → 800 at check:
-`outcome == 'true_positive'`, `growth_rate_actual == 70.0`, component columns preserved (0.9 etc.). Confirms the direction branch does not reclassify existing TP rows.
-
-### Real-DB smoke test
+### RED (Step 1, before implementation)
 
 ```
-$ python3 framework/stages/validate.py --metrics-only
-=== Prediction Validation Metrics ===
-Total evaluated: 0  (TP: 0, FP: 0)
-Pending (too recent): 0
-Recall candidates — FN (missed bursts): 0, TN: 0
---- Score Bucket Calibration ---
+Traceback (most recent call last):
+  File "<string>", line 5, in <module>
+AttributeError: 'ScoringEngine' object has no attribute 'calculate_buzz'
 ```
 
-ConfigLoader loads the real config.yaml without error; FN/TN lines render even with zero evaluated rows.
+### GREEN (Step 1 rerun, after implementation)
 
-## Files Changed
+```
+scoring OK 1.0 0.0 0.3
+```
 
-- `framework/stages/validate.py` (+95/-8)
+(hot=1.0 saturates all three sub-scores; cold=0.0; None -> default_buzz_score()=0.3; activity a1 == min(a0+0.1, 1.0) assertion passed)
 
-## Self-Review Findings
+### Step 5 smoke
 
-1. **Fixed during self-review**: I initially placed the recall print lines after the "Pending" line instead of after the precision block as the brief specifies. Moved them to after the `if total > 0:` precision block (outer indentation, so they still print when total == 0), re-verified, and amended the commit.
-2. **Cosmetic ordering note (per brief, not a defect)**: "Recorded N new FN candidates" prints before "Recorded N new predictions" because the brief places the FN block before `conn.commit()` while the TP count prints after it.
-3. FN rows' `growth_rate_predicted` (2.6) is written back unchanged by the UPDATE in the FN branch — consistent with the brief's note that `predicted_growth` is unused in the FN branch but the UPDATE stays as-is.
-4. `checked_at` set at record time is overwritten by the UPDATE at check time — same behavior as the existing TP flow.
-5. Double-record safety: both TP and FN queries guard with `NOT EXISTS (prediction_outcomes)`; a project whose latest signal flips to `is_early_burst=1` is excluded from FN by the `IS NOT 1` filter.
+```
+$ python3 framework/stages/reweight.py --dry-run && python3 framework/stages/validate.py --metrics-only >/dev/null && echo "smoke OK"
+Insufficient data for weight adjustment (need >= 20, got 0)
+Continue running the pipeline to accumulate more validated predictions.
+smoke OK
+```
+
+MIN_SAMPLES early-exit path works, no crash. `ast.parse` syntax check on discover.py passed; edited region visually re-verified (structure block before activity call site, buzz block after novelty, buzz_source in signals_json).
+
+## Files changed
+
+- `framework/core/scoring_engine.py`
+- `framework/stages/discover.py`
+- `framework/stages/reweight.py`
+
+Commit: `db8a278 feat: revive buzz as real signal, enhance activity with tests/CI facts, restore buzz in reweight` (3 files, +41/-4)
+
+## Self-review findings
+
+- Ordering constraint satisfied: `structure` is defined before the activity call site; buzz block placed after novelty (order irrelevant there, but matches brief).
+- `calculate_buzz` `_f` helper: on ValueError/TypeError it returns the raw default (50/5/5, all positive) — no zero-division risk.
+- `issue_health.get(...) or 0` treats 0/None identically — fine since all three metrics are non-negative counts/averages from L1.
+- Activity bonus only applies when at least one of has_tests/has_ci is not None, so projects without L1 structure data keep the old score exactly (backwards compatible).
+- reweight already read `community_buzz_at_pred` in its SQL (lines 65/76) — restoring the component is consistent with existing code; no schema change needed.
 
 ## Concerns
 
-None blocking. One latent note: FN recall denominator (`tp + fn`) mixes TP candidates from all sources with trending-only FN candidates, so "Recall (trending-source)" is an approximation — this matches the brief's formula exactly.
+- None blocking. Note (per brief V4): `early_burst_signals` mixes old-weight and new-weight regime rows, so cross-time overall_score comparison needs care — not a code issue introduced here.

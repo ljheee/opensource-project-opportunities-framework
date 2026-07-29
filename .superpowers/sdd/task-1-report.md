@@ -1,76 +1,83 @@
-# Task 1 Report: config.yaml 新配置键 + ConfigLoader getter
+# Task 1 Report: 配置与 schema 基础
 
-## What was implemented
+## What I implemented
 
-1. **config.yaml** (`sources.github` 段）:
-   - Added `created_within_days: 730`
-   - Added `backfill_max_pages: 30`
-   - Added `backfill_max_per_day: 50`
-2. **config.yaml** (`early_burst.metrics` weights renormalized, thresholds untouched):
-   - `star_velocity.weight`: 0.35 → 0.45
-   - `activity_index.weight`: 0.25 → 0.35
-   - `community_buzz.weight`: 0.25 → 0.0 (buzz out)
-   - `novelty_signal.weight`: 0.15 → 0.20
-   - New weights sum to 1.00
-3. **config.yaml** (`scheduling.incremental`): added `star_change_threshold: 0.05`, `recent_commit_days: 3`, `min_reanalyze_days: 7` alongside existing `max_per_day: 15`.
-4. **framework/core/config_loader.py**: inserted two methods verbatim from the brief after `get_star_range`:
-   - `get_created_within_days() -> int` (default 730, positive-int coercion)
-   - `get_backfill_config() -> Dict` (`max_pages` default 30, `max_per_day` default 50, positive-int coercion via inner `_pos_int`)
+1. **config.yaml**
+   - `sources.github.structure_max_per_day: 50` appended after `backfill_max_per_day`.
+   - `filters.known_ecosystem_packages` (9 high-level orchestration frameworks/SDKs) appended after `tech_layer_rules`.
+   - `early_burst.metrics` replaced verbatim per brief: weights 0.40 / 0.30 / 0.10 / 0.20; `community_buzz.thresholds` keeps `default_score: 0.3` and adds `reaction_total_full: 50`, `active_issues_full: 5`, `avg_comments_full: 5`.
+
+2. **framework/core/config_loader.py**
+   - `get_structure_max_per_day() -> int` (default 50, guards non-int / non-positive) inserted immediately after `get_backfill_config`.
+
+3. **framework/core/db.py** — all four edit sites:
+   - (a) `_migrate_projects`: appended `structure_json TEXT` via `_add_column_if_missing`.
+   - (b) `_migrate_analyses` ALTER section: appended `evidence_json TEXT` after `analyzer_version`.
+   - (c) `_migrate_analyses` CHECK-rebuild branch: `analyses_new` CREATE column list, INSERT column list, and SELECT column list all extended with `evidence_json` (SELECT reads it from the old table, safe because the ALTER in (b) runs first in the same call).
+   - (d) `_create_analyses` CREATE TABLE: `evidence_json TEXT` after `analyzer_version TEXT`.
 
 ## TDD evidence
 
-### RED — Step 1 (before implementation)
+### RED (Step 1, before changes)
 
 ```
-$ PYTHONPATH=. python3 -c "...assert c.get_created_within_days() == 730..."
 Traceback (most recent call last):
-  File "<string>", line 4, in <module>
-AttributeError: 'ConfigLoader' object has no attribute 'get_created_within_days'
+  File "<string>", line 5, in <module>
+AttributeError: 'ConfigLoader' object has no attribute 'get_structure_max_per_day'
+exit=1
 ```
 
-Failed exactly as predicted in the brief.
+Exactly the failure mode predicted by the brief.
 
-### GREEN — Step 4 (re-run Step 1 after implementation)
+### GREEN (Step 5, after changes)
+
+Step 1 rerun on a fresh `/tmp/t1_test.db`:
 
 ```
+DB migration: added projects.structure_json
 OK
+exit=0
 ```
 
-### GREEN — Step 5 (weight renormalization, spec §4 验证项 4)
+Production DB migration (`python3 framework/stages/init_db.py`):
 
 ```
-weights OK: 0.705
+DB migration: added projects.structure_json
+DB migration: added analyses.evidence_json
+Database initialized successfully.
+23|structure_json|TEXT|0||0
+13|evidence_json|TEXT|0||0
+prod migration OK
 ```
 
-### GREEN — Step 5b (old-vs-new weight flip comparison on real DB, read-only)
+Data integrity sanity check: `projects=1181 rows, analyses=27 rows` — unchanged by the additive migration.
+
+Config load check:
 
 ```
-712 projects, 36 flips
-  ('AlexsJones/llmfit', 0.565, 0.659, False)
-  ('Alishahryar1/free-claude-code', 0.561, 0.653, False)
-  ... (20 rows shown, all old_burst=False)
-weight migration OK
+{'star_velocity': 0.4, 'activity_index': 0.3, 'community_buzz': 0.1, 'novelty_signal': 0.2}
+buzz thresholds: {'default_score': 0.3, 'reaction_total_full': 50, 'active_issues_full': 5, 'avg_comments_full': 5}
+pkgs: 9
 ```
 
-712 latest-signal rows compared; 36 flips, assertion `36 <= max(2, 712//10=71)` holds. All flips are False→True: with `community_buzz` (which stores a low default ~0.3) zeroed out and its weight redistributed to velocity/activity, projects previously dragged just below 0.65 now cross the threshold. This is the intended effect of the migration; no True→False regressions. The DB was not modified (SELECT only).
+Weights sum to 1.0.
 
 ## Files changed
 
-- `/Users/lijianhua04/Documents/my-agents/catpawDesk-workspace/github-opportunities/opensource-project-opportunities-framework/config.yaml`
-- `/Users/lijianhua04/Documents/my-agents/catpawDesk-workspace/github-opportunities/opensource-project-opportunities-framework/framework/core/config_loader.py`
+- `config.yaml`
+- `framework/core/config_loader.py`
+- `framework/core/db.py`
 
-## Commit
+Commit: `2e33ffe feat: config keys and soft-migrated columns for tiered deep analysis` (exact message per brief Step 6).
 
-- `a4dbded feat: add discovery/backfill config keys, renormalize scoring weights (buzz out)` (2 files, +31/-4)
+## Self-review findings
 
-## Self-review
-
-- **Completeness:** All three config edits and both getters implemented exactly as the brief specifies, verbatim. New `scheduling.incremental` keys written but not consumed (correct — Task 6/13 territory).
-- **Quality:** Getters follow the existing defensive `get_star_range` pattern (defaults on missing/malformed values, positive-int guard). Methods inserted directly after `get_star_range` per the brief.
-- **YAGNI:** No extra getters, no consumers wired up, no schema changes.
-- **Test evidence:** RED confirmed before edits; Steps 4/5/5b all pass after edits; outputs quoted above.
+- Verified the brief's verbatim metrics YAML drops the old `thresholds` blocks for `star_velocity`, `activity_index`, and `novelty_signal`. Checked `framework/core/scoring_engine.py`: every threshold read uses `.get(key, <default>)` with defaults identical to the removed YAML values (0.15, 10, 3, 0.3, 6, 2), so scoring behavior is unchanged.
+- Idempotency: fresh DBs get both columns via the create/migrate path (verified on `/tmp/t1_test.db`); existing DBs via ALTER (verified on production). The CHECK-rebuild SELECT references `evidence_json` only after the ALTER section has guaranteed the column exists.
+- Crash-recovery branch in `_migrate_analyses` (analyses_new rename) returns before the ALTER section; on the next `init_tables()` run the ALTER section runs and adds `evidence_json`, so no gap. Same pre-existing pattern as `analyzer_version`.
+- YAGNI: no extra getters, no consumers wired, no schema changes beyond the two columns. requirements.txt untouched.
 
 ## Concerns
 
-1. **36 promotion flips (False→True).** The brief anticipated "预期翻转很少" given the DB had 0 early-bursts; 36/712 (5.1%) is within the assertion bound and all promotions, not regressions, but it means the next `discover.py` run will newly flag ~36 projects as early-burst. Downstream stages (schedule/validate) should expect a one-time bump in early-burst candidates.
-2. Git warned about auto-configured committer identity (`lijianhua04@MBP-...local`); commit is fine but identity comes from hostname, not explicit git config. Not a code issue.
+- `data/framework.db` was modified in the working tree by the Step 5 production migration but intentionally NOT committed, per the brief's Step 6 `git add` scope. The migration is idempotent and the run scripts commit `data/` on the next pipeline run, so this is safe.
+- Git warned about auto-configured committer identity (hostname-derived); commit content unaffected.

@@ -1,194 +1,177 @@
-### Task 7: validate.py 召回率回溯（FN 算法）
+### Task 7: 评分反哺（buzz 复活 + activity 增强 + reweight 组件表）
 
 **Files:**
-- Modify: `framework/stages/validate.py`（`record_new_predictions`、`check_pending_outcomes`、`print_metrics`）
+- Modify: `framework/core/scoring_engine.py`
+- Modify: `framework/stages/discover.py:553`（buzz 调用点）、`:537-539`（activity 调用点）、signals_json 构造
+- Modify: `framework/stages/reweight.py:20-25`
 
 **Interfaces:**
-- Consumes: `early_burst_signals.is_early_burst`、`projects.source`、`star_history` 最早样本
-- Produces: `prediction_outcomes.outcome` 新值 `false_negative` / `true_negative`；方向区分规则：`overall_score_at_prediction >= min_score` 为 TP 候选，否则为 FN 候选
-- 固定 FN 阈值 = `min_score × 8 × 0.5`（当前 0.65×8×0.5 = 2.6 stars/day），与 `_predicted_growth` 同源
+- Consumes: `projects.structure_json`（Task 3）、`_structure_within_budget` 返回值（Task 3）
+- Produces: `ScoringEngine.calculate_buzz(issue_health: Optional[Dict]) -> float`；`calculate_activity_index(open_issues, commit_frequency, pr_merge_rate=None, has_tests=None, has_ci=None)`；signals_json 新增 `buzz_source: "real" | "fallback"`
 
-- [ ] **Step 1: 顶部加配置读取与阈值常量**
-
-validate.py 的 import 区（第 14 行 `from framework.core.db import Database` 后）追加：
-
-```python
-from datetime import datetime, timezone
-
-from framework.core.config_loader import ConfigLoader
-
-
-def _fn_threshold() -> float:
-    """Fixed false-negative threshold: min_score x 8 x 0.5 (same basis as TP rule)."""
-    try:
-        min_score = ConfigLoader().get_early_burst_config().min_score
-    except Exception:
-        min_score = 0.65
-    return min_score * 8 * 0.5
-```
-
-注意：**方向判定不读 min_score**——FN 候选行在记录时组件列全 NULL，check 时用 `star_velocity_at_pred IS NULL` 判方向（见 Step 3），这样 reweight 未来调整 min_score 不会重分类存量 pending 行。
-
-- [ ] **Step 2: `record_new_predictions` 增加 FN 候选记录**
-
-现有函数（validate.py:27-75）末尾 `conn.commit()` **之前**插入 FN 候选段：
-
-```python
-        # FN candidates: trending-source projects that did NOT reach early-burst,
-        # old enough to evaluate, and never recorded before.
-        fn_threshold = _fn_threshold()
-        fn_cur = conn.execute('''
-            SELECT p.id as project_id, p.first_seen_at, p.stars,
-                   e.overall_score, e.calculated_at
-            FROM projects p
-            JOIN (
-                SELECT project_id, overall_score, calculated_at,
-                       ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY calculated_at DESC) as rn
-                FROM early_burst_signals
-            ) e ON p.id = e.project_id AND e.rn = 1
-            WHERE p.source = 'trending'
-              AND e.is_early_burst IS NOT 1
-              AND julianday('now') - julianday(p.first_seen_at) >= ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM prediction_outcomes po WHERE po.project_id = p.id
-              )
-        ''', (min_days_for_fn,))
-
-        fn_recorded = 0
-        for row in fn_cur.fetchall():
-            baseline = conn.execute('''
-                SELECT stars FROM star_history
-                WHERE project_id = ? ORDER BY sampled_at ASC LIMIT 1
-            ''', (row['project_id'],)).fetchone()
-            baseline_stars = baseline['stars'] if baseline else row['stars']
-            # 无星史样本时基线是当前 stars，checked_at 记首次发现日（spec §2.4-2）
-            if baseline:
-                checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-            else:
-                checked_at = str(row['first_seen_at'])[:10]
-            conn.execute('''
-                INSERT INTO prediction_outcomes
-                (project_id, predicted_at, stars_at_prediction,
-                 overall_score_at_prediction,
-                 star_velocity_at_pred, activity_index_at_pred,
-                 community_buzz_at_pred, novelty_at_pred,
-                 growth_rate_predicted,
-                 checked_at, outcome)
-                VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 'pending')
-            ''', (row['project_id'], row['first_seen_at'],
-                  baseline_stars, row['overall_score'],
-                  fn_threshold, checked_at))
-            fn_recorded += 1
-        print(f"Recorded {fn_recorded} new FN candidates")
-```
-
-注意 `e.is_early_burst IS NOT 1` 匹配 0 和 NULL（SQLite `IS NOT` 语义）。且该查询引用了 `e.is_early_burst`，需把它加入子查询 SELECT 列表：
-
-```python
-                SELECT project_id, overall_score, calculated_at, is_early_burst,
-                       ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY calculated_at DESC) as rn
-```
-
-`record_new_predictions` 签名加参数：`def record_new_predictions(db: Database, min_days_for_fn: int = 7):`
-
-- [ ] **Step 3: `check_pending_outcomes` 加方向分支**
-
-先给现有 SELECT（validate.py:83-93）加一列——方向判定需要它：
-
-```sql
-            SELECT po.id, po.project_id, po.stars_at_prediction,
-                   po.overall_score_at_prediction, po.predicted_at,
-                   po.growth_rate_predicted, po.star_velocity_at_pred,
-                   p.stars as stars_now,
-```
-
-然后 validate.py:96-141 的行内处理循环中，把判定段（现有 124-130 行的 TP/FP 判定）替换为：
-
-```python
-            # 方向在记录时已固化：FN 候选行的组件列全为 NULL（Step 2 插入的）。
-            # 不要用 score vs 当前 min_score 重判——reweight 可能已调整阈值，
-            # 会把存量 TP 候选行错误重分类。
-            is_tp_candidate = row['star_velocity_at_pred'] is not None
-
-            if is_tp_candidate:
-                # 原有 TP 候选逻辑（保持不变）
-                if stars_now <= stars_then:
-                    outcome = 'false_positive'
-                elif actual_growth >= predicted_growth * 0.5:
-                    outcome = 'true_positive'
-                else:
-                    outcome = 'false_positive'
-            else:
-                # FN 候选：实际增速超过固定阈值 = 我们漏掉的爆发
-                if actual_growth >= _fn_threshold():
-                    outcome = 'false_negative'
-                else:
-                    outcome = 'true_negative'
-```
-
-（`predicted_growth` 变量在 FN 分支未用，但 UPDATE 仍写回，保持现有 UPDATE 语句不变。）
-
-- [ ] **Step 4: `print_metrics` 加 FN/TN 与 recall**
-
-validate.py:152-177 的计数区，在 `pending` 计数后追加：
-
-```python
-        try:
-            fn = int(conn.execute(
-                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'false_negative'"
-            ).fetchone()[0] or 0)
-        except (ValueError, TypeError):
-            fn = 0
-        try:
-            tn = int(conn.execute(
-                "SELECT COUNT(*) FROM prediction_outcomes WHERE outcome = 'true_negative'"
-            ).fetchone()[0] or 0)
-        except (ValueError, TypeError):
-            tn = 0
-```
-
-在 `print(f"Precision (7d+ horizon): ...")` 块后追加：
-
-```python
-        print(f"Recall candidates — FN (missed bursts): {fn}, TN: {tn}")
-        if tp + fn > 0:
-            print(f"Recall (trending-source): {tp / (tp + fn):.2%}")
-```
-
-- [ ] **Step 5: 构造数据验证（spec §4 验证项 7 的 FN 构造用例）**
+- [ ] **Step 1: 写失败验证**
 
 ```bash
-PYTHONPATH=. python3 - <<'EOF'
-from framework.core.db import Database
-db = Database('/tmp/fn_test.db')
-db.init_tables()
-conn = db.get_conn()
-# 造一个 trending 源、未达标、10 天前首次发现、当时 100 stars、现在 500 stars 的项目
-conn.execute("""INSERT INTO projects (id, name, url, stars, source, status, first_seen_at)
-  VALUES ('a/b', 'b', 'http://x', 500, 'trending', 'discovered', datetime('now', '-10 days'))""")
-conn.execute("INSERT INTO star_history (project_id, sampled_at, stars) VALUES ('a/b', date('now','-10 days'), 100)")
-conn.execute("INSERT INTO early_burst_signals (project_id, calculated_at, overall_score, is_early_burst) VALUES ('a/b', datetime('now','-10 days'), 0.40, 0)")
-conn.commit(); conn.close()
-
-import framework.stages.validate as v
-v.record_new_predictions(db, min_days_for_fn=7)
-v.check_pending_outcomes(db, min_days=7)
-conn = db.get_conn()
-row = conn.execute("SELECT * FROM prediction_outcomes WHERE project_id='a/b'").fetchone()
-d = dict(row); print(d)
-# 增速 = (500-100)/10 = 40 stars/day >= 2.6 -> false_negative
-assert d['outcome'] == 'false_negative', d['outcome']
-conn.close()
-print('FN pipeline OK')
-EOF
+PYTHONPATH=. python3 -c "
+from framework.core.config_loader import ConfigLoader
+from framework.core.scoring_engine import ScoringEngine
+se = ScoringEngine(ConfigLoader().get_early_burst_config())
+hot = se.calculate_buzz({'reaction_total': 80, 'avg_comments': 6.0, 'active_issues_30d': 6})
+cold = se.calculate_buzz({'reaction_total': 0, 'avg_comments': 0.0, 'active_issues_30d': 0})
+none = se.calculate_buzz(None)
+assert hot > cold >= 0.0, (hot, cold)
+assert none == se.default_buzz_score(), none
+a1 = se.calculate_activity_index(10, 5.0, has_tests=True, has_ci=True)
+a0 = se.calculate_activity_index(10, 5.0)
+assert abs(a1 - min(a0 + 0.1, 1.0)) < 1e-9, (a0, a1)
+print('scoring OK', hot, cold, none)
+"
 ```
 
-Expected: 输出 `FN pipeline OK`（若断言行顺序因日期边界差 1 天失败，把 -10 改为 -12 重跑）
+Expected: FAIL — `AttributeError: 'ScoringEngine' object has no attribute 'calculate_buzz'` 或 activity 参数 TypeError
+
+- [ ] **Step 2: scoring_engine 实现**
+
+`default_buzz_score` 之后插入：
+
+```python
+    def calculate_buzz(self, issue_health: Optional[Dict]) -> float:
+        """Real community buzz from L1 issue health. None -> default fallback."""
+        if not issue_health or not isinstance(issue_health, dict):
+            return self.default_buzz_score()
+        t = self._thresholds('community_buzz')
+        def _f(key, default):
+            try:
+                return max(float(t.get(key, default)), 0.0001)
+            except (ValueError, TypeError):
+                return default
+        reaction_score = min((issue_health.get('reaction_total') or 0) / _f('reaction_total_full', 50), 1.0)
+        active_score = min((issue_health.get('active_issues_30d') or 0) / _f('active_issues_full', 5), 1.0)
+        comments_score = min((issue_health.get('avg_comments') or 0) / _f('avg_comments_full', 5), 1.0)
+        return min(reaction_score * 0.5 + active_score * 0.3 + comments_score * 0.2, 1.0)
+```
+
+`calculate_activity_index` 签名改为 `(self, open_issues, commit_frequency, pr_merge_rate=None, has_tests=None, has_ci=None)`，`return min(score, 1.0)` 之前插入：
+
+```python
+        if has_tests is not None or has_ci is not None:
+            if has_tests and has_ci:
+                score += 0.1
+            elif has_tests or has_ci:
+                score += 0.05
+```
+
+- [ ] **Step 3: discover 评分接线**
+
+`_calculate_and_store_burst_score` 中，Task 3 加的 `fresh_facts = self._structure_within_budget(project_id, conn)` 行之后插入：
+
+```python
+            structure = None
+            if fresh_facts:
+                structure = fresh_facts
+            elif proj['structure_json']:
+                try:
+                    structure = json.loads(proj['structure_json'])
+                except (json.JSONDecodeError, TypeError):
+                    structure = None
+```
+
+buzz 调用点改为：
+
+```python
+            issue_health = (structure or {}).get('issue_health')
+            buzz_score = self.scoring.calculate_buzz(issue_health)
+            buzz_source = 'real' if issue_health else 'fallback'
+```
+
+activity 调用点改为：
+
+```python
+            activity_score = self.scoring.calculate_activity_index(
+                open_issues, commit_frequency,
+                has_tests=(structure or {}).get('has_tests'),
+                has_ci=(structure or {}).get('has_ci')
+            )
+```
+
+signals_json 的 dict 中加一行：`'buzz_source': buzz_source,`
+
+- [ ] **Step 4: reweight COMPONENTS 加回**
+
+reweight.py:20-25 改为：
+
+```python
+COMPONENTS = ['star_velocity', 'activity_index', 'community_buzz', 'novelty_signal']
+COMPONENT_COLS = {
+    'star_velocity': 'star_velocity_at_pred',
+    'activity_index': 'activity_index_at_pred',
+    'community_buzz': 'community_buzz_at_pred',
+    'novelty_signal': 'novelty_at_pred',
+}
+```
+
+- [ ] **Step 5: 重跑 Step 1 验证 + reweight/validate 冒烟（spec §7 验证项 4/5）**
+
+```bash
+python3 framework/stages/reweight.py --dry-run && python3 framework/stages/validate.py --metrics-only >/dev/null && echo "smoke OK"
+```
+
+Expected: Step 1 输出 `scoring OK`；dry-run 走 MIN_SAMPLES 早退不崩；输出 `smoke OK`
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add framework/stages/validate.py
-git commit -m "feat: track false negatives for trending-source misses (recall loop)"
+git add framework/core/scoring_engine.py framework/stages/discover.py framework/stages/reweight.py
+git commit -m "feat: revive buzz as real signal, enhance activity with tests/CI facts, restore buzz in reweight"
 ```
+
+---
+
+## 最终全链路验证（spec §7）
+
+- [ ] **V1**: L1 真实采集：`python3 framework/stages/discover.py`（后台），日志出现 structure 采集且预算 ≤50；`sqlite3 data/framework.db "SELECT COUNT(*) FROM projects WHERE structure_json IS NOT NULL;"` > 0；抽查 3 个项目 structure_json 字段合理。另用 `PYTHONPATH=. python3 -c` 驱动 `_fetch_structure_facts` 打一个已知大型 monorepo（如 `microsoft/vscode`），断言返回 dict 的 `partial` 为 True 且 `core_paths == []`（truncated 降级负例，spec §7 验证项 1）
+- [ ] **V2**: L1 幂等：同日二次跑 discover，`structure_json` 的 fetched_at 不变（不重复采集）
+- [ ] **V3**: L2 程序化断言（spec §7 验证项 3）：`USE_LLM=true CLI_TOOL="claude --dangerously-skip-permissions" python3 framework/stages/analyze.py --date $(date -u +%Y-%m-%d) --use-llm --max-tasks 3` 后——若 3 个任务都有 core_paths，先手动挑 1 个 `core_paths_reason='no_match'` 的项目补跑（保证覆盖无参考集路径）：
+
+```bash
+PYTHONPATH=. python3 - <<'EOF'
+import json
+from framework.core.db import Database
+conn = Database().get_conn()
+rows = conn.execute("""
+    SELECT a.evidence_json, p.structure_json FROM analyses a
+    JOIN projects p ON a.project_id = p.id
+    WHERE a.analyzer_version = 'llm-v1' AND a.evidence_json IS NOT NULL
+    ORDER BY a.id DESC LIMIT 3
+""").fetchall()
+assert rows, 'no llm-v1 analyses with evidence'
+for r in rows:
+    ev = json.loads(r['evidence_json'])
+    for k in ('innovation_evidence', 'problem_evidence', 'confidence', 'cannot_determine', 'validation'):
+        assert k in ev, (k, ev)
+    st = json.loads(r['structure_json']) if r['structure_json'] else {}
+    core = st.get('core_paths') or []
+    if core:
+        tokens = core + [p.rsplit('/', 1)[-1] for p in core if '/' in p]
+        for item in ev['innovation_evidence']:
+            assert any(t.lower() in item.lower() for t in tokens), item
+    if ev['cannot_determine']:
+        assert ev['confidence'] != 'high', ev
+print('L2 evidence assertions OK:', len(rows), 'analyses')
+EOF
+```
+
+Expected: 输出 `L2 evidence assertions OK`
+- [ ] **V4**: 反哺对比：挑 1 个已有 L1 数据的项目，对比其 buzz_source=real 的最新评分与历史 fallback 评分。注意：early_burst_signals 表中混存旧权重（0.45/0.35/0.0/0.20）与新权重（0.40/0.30/0.10/0.20）两个 regime 的行，横向对比整体分时注意口径（prediction_outcomes 实测 0 行，闭环不受影响）
+- [ ] **V5**: `reweight.py --dry-run`、`validate.py --metrics-only` 不崩
+- [ ] **V6**: 速率消耗观察：discover 日志无 rate limit 长等待
+
+## 执行前置条件
+
+1. 工作区应干净（`git status --short` 无代码改动）；data/ 下的 DB/报告改动属正常 pipeline 产物
+2. `.env` 中 GITHUB_TOKEN 有效（L1/L2 真实抓取依赖）
+3. 本机网络对 stargazers 404 属已知网关限制，不影响本计划（trees/issues/raw 已实测可用）
+
+
+
 

@@ -1,46 +1,58 @@
-# Task 6 Report: reweight.py 移除 buzz 组件并修复 backtest
+# Task 6 Report: 证据成员校验 + evidence_json 存储
+
+> Note: this file previously contained a stale report from an unrelated earlier "Task 6" (reweight.py buzz removal, commit 2b980b4, different plan). Overwritten per team-lead instruction to use this path.
+
+**Status:** DONE
+**Commit:** 3228810 feat: deterministic evidence membership validation and evidence_json storage
 
 ## What was implemented
 
-Exactly as the brief specified:
+All in `framework/stages/analyze.py`:
 
-1. `framework/stages/reweight.py:20-25` — `COMPONENTS` reduced to `['star_velocity', 'activity_index', 'novelty_signal']`; `community_buzz` entry removed from `COMPONENT_COLS`.
-2. `framework/stages/reweight.py` `backtest()` — rewritten to compute `new_score` dynamically via `sum((r.get(COMPONENT_COLS[c]) or 0) * new_weights.get(c, 0) for c in COMPONENTS)` instead of four hardcoded weight lookups.
+1. **`_evidence_matches(text, candidates)`** — case-insensitive substring membership helper.
+2. **`_validate_evidence(analysis, structure)`** — deterministic hallucination guard:
+   - `innovation_evidence` items must mention a `core_paths` file (full path or basename); `problem_evidence` items must mention a real `top_issues` title (titles < 8 chars excluded from the reference set).
+   - No reference set (empty core_paths / empty usable titles, e.g. partial/no_match/uncollected structure) → ALL items of that kind stripped, `unverifiable_*` recorded in meta (conservative design: unverifiable evidence is NOT passed through).
+   - Stripped-to-empty non-empty list → `confidence='low'` + dimension appended to `cannot_determine` (`innovation_summary` / `problem_solved`).
+   - Returns `(cleaned_analysis, meta)` with `stripped_innovation` / `stripped_problem` counts.
+3. **Format validation in `validate_analysis_output`** — inserted before the `# Ensure opportunities is a list` block: coerces `innovation_evidence`/`problem_evidence`/`cannot_determine` to `[]` when not lists; `confidence` not in {high, medium, low} → `'medium'`.
+4. **Validation chain wiring in `generate_analysis_with_llm`** — after the `validate_analysis_output` success branch, before `return analysis`: `_validate_evidence(analysis, project.get('structure'))`, then `analysis['_evidence_meta'] = evidence_meta`. The private key rides on the analysis dict; the INSERT's explicit column list keeps it out of the DB.
+5. **`store_analysis_and_opportunities`** — new `evidence: Optional[Dict] = None` param; INSERT column list gains `evidence_json`, bound as `json.dumps(evidence, ensure_ascii=False) if evidence else None`.
+6. **`run_analysis`** — builds the evidence dict only when `analyzer_version == 'llm-v1'` (`innovation_evidence`, `problem_evidence`, `confidence` default 'medium', `cannot_determine`, `validation` from `_evidence_meta` default `{}`), passes it to the store call. Heuristic path stores NULL.
 
 ## TDD evidence
 
-### RED (Step 1, before change)
+### RED (Step 1, before implementation)
 
 ```
-AssertionError: buzz still in COMPONENTS
-```
-(exit code 1 — matches expected failure; backtest would also KeyError on `new_weights['community_buzz']`)
-
-### GREEN (Step 4, after change)
-
-Step 1 verification rerun:
-```
-backtest OK: 1.0 1 0
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+ImportError: cannot import name '_validate_evidence' from 'framework.stages.analyze' (/Users/lijianhua04/Documents/my-agents/catpawDesk-workspace/github-opportunities/opensource-project-opportunities-framework/framework/stages/analyze.py)
 ```
 
-Dry-run smoke test (`python3 framework/stages/reweight.py --dry-run`):
+### GREEN (Step 5, after implementation)
+
 ```
-Insufficient data for weight adjustment (need >= 20, got 0)
-Continue running the pipeline to accumulate more validated predictions.
+evidence validation OK
+compile OK
 ```
-(exit code 0 — matches expected output; 0 outcome rows, normal path, no crash)
+
+### Additional smoke tests (beyond brief, same session)
+
+- `PRAGMA table_info(analyses)` on live `data/framework.db`: `13|evidence_json|TEXT|0||0` — Task 1 migration column confirmed present.
+- Fresh-schema end-to-end store test (temp DB via `db.init_tables()`): llm-v1 row persisted `evidence_json` with correct `confidence`/`validation`; heuristic-v1 row persisted NULL. Output: `store evidence smoke OK`.
 
 ## Files changed
 
-- `framework/stages/reweight.py` (commit 2b980b4, +4/-7)
+- `framework/stages/analyze.py` (+88 / -5), commit 3228810. Only this file was staged/committed; pre-existing dirty `.superpowers/sdd/*` and `data/framework.db` changes from other agents were left untouched.
 
 ## Self-review findings
 
-- `fetch_outcomes()` still SELECTs and coerces `community_buzz_at_pred` from `prediction_outcomes`. Intentionally left as-is: the brief scopes the change to COMPONENTS/COMPONENT_COLS and backtest; the DB column still exists, and keeping the fetch harmless-extra is consistent with "column retained in history" semantics. All downstream consumers of these rows (`compute_component_correlation`, `propose_new_weights`, `print_proposal`, `backtest`) iterate `COMPONENTS`, so buzz is never scored or proposed.
-- `load_current_weights` iterates `COMPONENTS` (now 3 components) and reads weights from config.yaml — consistent with Task 1 which zeroed `community_buzz.weight`; buzz is simply ignored rather than read.
-- `apply_config_changes` writes only keys in `new_weights` (3 components), so `--apply` will not touch `community_buzz.weight` in config.yaml.
-- Verified commit diff contains only the Task 6 change — no stray pre-existing modifications were swept in.
+- Brief code applied verbatim; placement anchors matched the current file (`validate_analysis_output` at :495, retry-loop validation call in `generate_analysis_with_llm`, store call in `run_analysis`).
+- `_evidence_meta` cannot leak into `analyses` — the INSERT uses an explicit column list.
+- `run_analysis` reaches the store with `analyzer_version == 'llm-v1'` only when `generate_analysis_with_llm` returned non-None, so `_evidence_meta` is always set there; `.get(...) or {}` guards anyway.
+- Heuristic path (`heuristic-v1`) stores NULL evidence_json — verified in smoke test.
 
 ## Concerns
 
-None.
+None blocking. Minor observation (by design, not changed): issue titles shorter than 8 chars are excluded from the problem-evidence reference set, so a project whose only top issues have very short titles behaves like "no reference set" for problem evidence (all problem evidence stripped as unverifiable). This matches the brief's deliberate conservative semantics.

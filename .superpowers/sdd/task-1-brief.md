@@ -1,155 +1,126 @@
-### Task 1: config.yaml 新配置键 + ConfigLoader getter
+### Task 1: 配置与 schema 基础
 
 **Files:**
 - Modify: `config.yaml`
-- Modify: `framework/core/config_loader.py`
+- Modify: `framework/core/config_loader.py`（`get_backfill_config` 后）
+- Modify: `framework/core/db.py`（`_migrate_projects`、`_migrate_analyses`、`_create_analyses`）
 
 **Interfaces:**
 - Produces:
-  - `ConfigLoader.get_created_within_days() -> int`（默认 730）
-  - `ConfigLoader.get_backfill_config() -> Dict`（`{'max_pages': int 默认30, 'max_per_day': int 默认50}`）
-  - Task 6/13 用到的 `scheduling.incremental` 新键在 Task 13 才消费，本任务只写配置
+  - `ConfigLoader.get_structure_max_per_day() -> int`（默认 50）
+  - `projects.structure_json` / `analyses.evidence_json` 两列（后续任务直接读写）
+  - config 键：`sources.github.structure_max_per_day`、`filters.known_ecosystem_packages`、权重 0.40/0.30/0.20/0.10
 
 - [ ] **Step 1: 写失败验证**
 
 ```bash
 PYTHONPATH=. python3 -c "
 from framework.core.config_loader import ConfigLoader
+from framework.core.db import Database
 c = ConfigLoader()
-assert c.get_created_within_days() == 730, 'missing get_created_within_days'
-bf = c.get_backfill_config()
-assert bf['max_pages'] == 30 and bf['max_per_day'] == 50, bf
+assert c.get_structure_max_per_day() == 50, 'getter missing'
+db = Database('/tmp/t1_test.db'); db.init_tables()
+conn = db.get_conn()
+pcols = [r[1] for r in conn.execute('PRAGMA table_info(projects)').fetchall()]
+acols = [r[1] for r in conn.execute('PRAGMA table_info(analyses)').fetchall()]
+assert 'structure_json' in pcols, pcols
+assert 'evidence_json' in acols, acols
+conn.close()
 print('OK')
 "
 ```
 
-Expected: FAIL — `AttributeError: 'ConfigLoader' object has no attribute 'get_created_within_days'`
+Expected: FAIL — `AttributeError: 'ConfigLoader' object has no attribute 'get_structure_max_per_day'`
 
 - [ ] **Step 2: 修改 config.yaml**
 
-`sources.github` 段（第 34-43 行区域）的 `star_range` 后追加：
+`sources.github` 段（`backfill_max_per_day` 后）追加：
 
 ```yaml
-    star_range: [50, 50000]
-    created_within_days: 730
-    backfill_max_pages: 30
-    backfill_max_per_day: 50
+    structure_max_per_day: 50
 ```
 
-`early_burst.metrics` 各组件 weight 改为：
+`filters` 段（`tech_layer_rules` 后）追加：
+
+```yaml
+  known_ecosystem_packages:
+    - "langchain"
+    - "langchain-core"
+    - "llama-index"
+    - "openai"
+    - "anthropic"
+    - "llama-cpp-python"
+    - "haystack-ai"
+    - "semantic-kernel"
+    - "dspy"
+```
+
+（语义：仅高层编排框架/SDK，明确不含 torch/transformers/numpy 等基础库）
+
+`early_burst.metrics` 权重改为：
 
 ```yaml
     star_velocity:
-      weight: 0.45
+      weight: 0.40
     activity_index:
-      weight: 0.35
+      weight: 0.30
     community_buzz:
-      weight: 0.0
+      weight: 0.10
+      thresholds:
+        default_score: 0.3
+        reaction_total_full: 50
+        active_issues_full: 5
+        avg_comments_full: 5
     novelty_signal:
       weight: 0.20
 ```
 
-（各组件的 thresholds 子键保持不变）
+（community_buzz.thresholds 保留原 default_score，新增三个实值阈值）
 
-`scheduling.incremental` 段改为：
+- [ ] **Step 3: config_loader.py 追加 getter**
 
-```yaml
-  incremental:
-    max_per_day: 15
-    star_change_threshold: 0.05
-    recent_commit_days: 3
-    min_reanalyze_days: 7
-```
-
-- [ ] **Step 3: config_loader.py 追加两个方法**
-
-在 `get_star_range` 方法（约第 94-105 行）之后插入：
+在 `get_backfill_config` 方法之后插入：
 
 ```python
-    def get_created_within_days(self) -> int:
-        raw = ((self.load().get('sources') or {}).get('github') or {}).get('created_within_days', 730)
+    def get_structure_max_per_day(self) -> int:
+        raw = ((self.load().get('sources') or {}).get('github') or {}).get('structure_max_per_day', 50)
         try:
             val = int(raw)
         except (ValueError, TypeError):
-            return 730
-        return val if val > 0 else 730
-
-    def get_backfill_config(self) -> Dict:
-        gh = ((self.load().get('sources') or {}).get('github') or {})
-        def _pos_int(key, default):
-            try:
-                val = int(gh.get(key, default))
-            except (ValueError, TypeError):
-                return default
-            return val if val > 0 else default
-        return {
-            'max_pages': _pos_int('backfill_max_pages', 30),
-            'max_per_day': _pos_int('backfill_max_per_day', 50),
-        }
+            return 50
+        return val if val > 0 else 50
 ```
 
-- [ ] **Step 4: 重跑 Step 1 验证**
+- [ ] **Step 4: db.py 三处加列**
 
-Expected: 输出 `OK`
+(a) `_migrate_projects` 末尾追加：
 
-- [ ] **Step 5: 权重迁移对比验证（spec §4 验证项 4）**
+```python
+        self._add_column_if_missing(conn, 'projects', 'structure_json', 'TEXT')
+```
+
+(b) `_migrate_analyses` 的 ALTER 段（`self._add_column_if_missing(conn, 'analyses', 'analyzer_version', 'TEXT')` 后）追加：
+
+```python
+        self._add_column_if_missing(conn, 'analyses', 'evidence_json', 'TEXT')
+```
+
+(c) `_migrate_analyses` 的 CHECK 重建分支：`analyses_new` 的 CREATE TABLE 列清单在 `analyzer_version TEXT` 后加 `,\n                evidence_json TEXT`；INSERT INTO analyses_new 的列清单和 SELECT 列清单同步各加 `evidence_json`。
+
+(d) `_create_analyses` 的 CREATE TABLE 同样在 `analyzer_version TEXT` 后加 `,\n                evidence_json TEXT`。
+
+- [ ] **Step 5: 重跑 Step 1 验证 + 生产库软迁移**
 
 ```bash
-PYTHONPATH=. python3 -c "
-from framework.core.config_loader import ConfigLoader
-from framework.core.scoring_engine import ScoringEngine
-se = ScoringEngine(ConfigLoader().get_early_burst_config())
-r = se.calculate_overall(0.8, 0.7, 0.3, 0.5)
-assert abs(r['overall_score'] - (0.8*0.45 + 0.7*0.35 + 0.5*0.20)) < 1e-9, r
-print('weights OK:', round(r['overall_score'], 3))
-"
+python3 framework/stages/init_db.py && sqlite3 data/framework.db "PRAGMA table_info(projects);" | grep structure_json && sqlite3 data/framework.db "PRAGMA table_info(analyses);" | grep evidence_json && echo "prod migration OK"
 ```
 
-Expected: 输出 `weights OK: 0.705`
-
-- [ ] **Step 5b: 新旧权重翻转对比（spec §4 验证项 4）**
-
-```bash
-PYTHONPATH=. python3 - <<'EOF'
-from framework.core.config_loader import ConfigLoader
-from framework.core.db import Database
-from framework.core.scoring_engine import ScoringEngine
-
-db = Database()
-conn = db.get_conn()
-rows = conn.execute('''
-    SELECT project_id, star_velocity_score, activity_index_score,
-           community_buzz_score, novelty_score, overall_score, is_early_burst
-    FROM (
-        SELECT *, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY calculated_at DESC) rn
-        FROM early_burst_signals
-    ) WHERE rn = 1
-''').fetchall()
-new_se = ScoringEngine(ConfigLoader().get_early_burst_config())
-OLD_W = {'v': 0.35, 'a': 0.25, 'b': 0.25, 'n': 0.15}
-flips = []
-for r in rows:
-    old_score = (r['star_velocity_score']*OLD_W['v'] + r['activity_index_score']*OLD_W['a']
-                 + r['community_buzz_score']*OLD_W['b'] + r['novelty_score']*OLD_W['n'])
-    new = new_se.calculate_overall(r['star_velocity_score'], r['activity_index_score'],
-                                   r['community_buzz_score'], r['novelty_score'])
-    old_burst = old_score >= 0.65
-    if old_burst != new['is_early_burst']:
-        flips.append((r['project_id'], round(old_score,3), round(new['overall_score'],3), old_burst))
-print(f'{len(rows)} projects, {len(flips)} flips')
-for f in flips[:20]:
-    print(' ', f)
-assert len(flips) <= max(2, len(rows) // 10), '翻转比例异常，检查权重配置'
-print('weight migration OK')
-EOF
-```
-
-Expected: 打印翻转名单（当前库 0 个 early-burst，预期翻转很少），输出 `weight migration OK`
+Expected: Step 1 输出 `OK`；生产库两列存在且数据未受影响
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add config.yaml framework/core/config_loader.py
-git commit -m "feat: add discovery/backfill config keys, renormalize scoring weights (buzz out)"
+git add config.yaml framework/core/config_loader.py framework/core/db.py
+git commit -m "feat: config keys and soft-migrated columns for tiered deep analysis"
 ```
 
