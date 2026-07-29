@@ -30,7 +30,7 @@
 |---|---|---|
 | `GET /repos/{}/git/trees/HEAD?recursive=1` | 1 次 API | `has_tests` / `has_ci` / `has_docs` / `has_examples`（目录名匹配）；清单文件路径（pyproject.toml / package.json / Cargo.toml / go.mod，按项目语言取第一个命中）；`core_paths`（`src/`、`core/`、`lib/` 下路径含 model / inference / engine / agent / server 关键词的 .py/.ts/.rs/.go 文件，取前 3 个） |
 | 清单文件内容 | raw.githubusercontent.com（不占 API 限额） | `dependencies` 列表；`is_wrapper_likely`：依赖与 `filters.known_ecosystem_packages`（config 新增键）有交集 |
-| `GET /repos/{}/issues?state=all&sort=comments&direction=desc&per_page=10` | 1 次 API | `issue_health`：top10 reaction 总和、平均评论数、近 30 天活跃 issue 数 |
+| `GET /repos/{}/issues?state=all&sort=comments&direction=desc&per_page=10` | 1 次 API | `issue_health`：top10 reaction 总和、平均评论数、近 30 天活跃 issue 数（top10 中 `updated_at` 在近 30 天内的条数）；另存 `top_issues`：评论数前 5 的 `{title, comments, reactions}`（供 L2 直接使用，避免重复调用） |
 
 ### 2.3 存储
 
@@ -50,7 +50,7 @@ L1 不碰 LLM、不改 prompt、不改评分公式，单独交付即有价值。
 
 1. **骨架事实**：读 `projects.structure_json`（0 成本）
 2. **核心文件节选**：按 `core_paths` 取前 3 个文件，经 `raw.githubusercontent.com/{repo}/HEAD/{path}` 抓取（不占 API 限额），各取前 5000 字符；core_paths 为空或抓取失败 → 该段标注 unavailable，分析继续
-3. **社区信号**：`issue_health` 统计 + 重取 top 5 issue 标题列表（1 次 API 调用）
+3. **社区信号**：`issue_health` 统计 + `top_issues` 标题列表（均来自 `structure_json`，0 成本）
 
 ### 3.2 prompt 契约（ai_analyze.md）
 
@@ -98,7 +98,7 @@ Top Opportunities 区不变；early-burst 项目区不加新展示（YAGNI）。
 | 项 | 计算 | 调用数 |
 |---|---|---|
 | L1 结构判读 | ≤50 预算 × ~2 次 API（清单文件走 raw 免费） | ≤100 |
-| L2 核心文件 + issue 标题 | ≤15 × 1（核心文件走 raw 免费） | ≤15 |
+| L2 核心文件 + 社区信号 | 核心文件走 raw 免费；社区信号读 structure_json | ≈0 |
 | 现有开销（前 spec §2.5） | topics / ecosystem / trending / backfill / commits / README | ~400-500 |
 | **合计** | | **~500-600**，限额内宽裕 |
 
