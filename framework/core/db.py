@@ -47,6 +47,7 @@ class Database:
         self._add_column_if_missing(conn, 'projects', 'contributor_count', 'INTEGER')
         self._add_column_if_missing(conn, 'projects', 'prev_stars', 'INTEGER')
         self._add_column_if_missing(conn, 'projects', 'prev_open_issues', 'INTEGER')
+        self._add_column_if_missing(conn, 'projects', 'structure_json', 'TEXT')
 
     def _migrate_tasks(self, conn):
         """Migrate tasks table: add missing columns."""
@@ -98,6 +99,7 @@ class Database:
         self._add_column_if_missing(conn, 'analyses', 'ecosystem_position', 'TEXT')
         self._add_column_if_missing(conn, 'analyses', 'commercialization_path', 'TEXT')
         self._add_column_if_missing(conn, 'analyses', 'analyzer_version', 'TEXT')
+        self._add_column_if_missing(conn, 'analyses', 'evidence_json', 'TEXT')
 
         has_check = False
         cursor = conn.execute(
@@ -124,7 +126,8 @@ class Database:
                 ecosystem_position TEXT,
                 commercialization_path TEXT,
                 overall_score INTEGER CHECK(overall_score BETWEEN 1 AND 10),
-                analyzer_version TEXT
+                analyzer_version TEXT,
+                evidence_json TEXT
             )
         """)
         conn.execute("""
@@ -132,7 +135,7 @@ class Database:
                 id, project_id, analyzed_at, tech_layer, application,
                 problem_solved, innovation_summary, differentiation,
                 market_timing, ecosystem_position, commercialization_path,
-                overall_score, analyzer_version
+                overall_score, analyzer_version, evidence_json
             )
             SELECT
                 id, project_id, analyzed_at, tech_layer, application,
@@ -141,7 +144,7 @@ class Database:
                 CASE WHEN CAST(COALESCE(overall_score, 5) AS INTEGER) < 1 THEN 1
                      WHEN CAST(COALESCE(overall_score, 5) AS INTEGER) > 10 THEN 10
                      ELSE CAST(COALESCE(overall_score, 5) AS INTEGER) END,
-                analyzer_version
+                analyzer_version, evidence_json
             FROM analyses
         """)
         conn.execute("DROP TABLE analyses")
@@ -263,7 +266,8 @@ class Database:
                 ecosystem_position TEXT,
                 commercialization_path TEXT,
                 overall_score INTEGER CHECK(overall_score BETWEEN 1 AND 10),
-                analyzer_version TEXT
+                analyzer_version TEXT,
+                evidence_json TEXT
             )
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_ana_proj ON analyses(project_id)')

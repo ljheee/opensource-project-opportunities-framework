@@ -44,6 +44,7 @@ sources:
     created_within_days: 730
     backfill_max_pages: 30
     backfill_max_per_day: 50
+    structure_max_per_day: 50
 
   trending:
     languages: ["python", "typescript", "rust", "go"]
@@ -60,24 +61,18 @@ early_burst:
   min_score: 0.65
   metrics:
     star_velocity:
-      weight: 0.45
-      thresholds:
-        weekly_growth_rate: 0.15
-        daily_absolute: 10
+      weight: 0.40
     activity_index:
-      weight: 0.35
-      thresholds:
-        commit_frequency: 3
-        pr_merge_rate: 0.3
+      weight: 0.30
     community_buzz:
-      weight: 0.0
+      weight: 0.10
       thresholds:
         default_score: 0.3
+        reaction_total_full: 50
+        active_issues_full: 5
+        avg_comments_full: 5
     novelty_signal:
       weight: 0.20
-      thresholds:
-        first_commit_within_months: 6
-        unique_contributors_weekly: 2
 
 filters:
   required:
@@ -136,6 +131,16 @@ filters:
       - "sdk"
       - "library"
       - "framework"
+  known_ecosystem_packages:
+    - "langchain"
+    - "langchain-core"
+    - "llama-index"
+    - "openai"
+    - "anthropic"
+    - "llama-cpp-python"
+    - "haystack-ai"
+    - "semantic-kernel"
+    - "dspy"
 
 scheduling:
   bulk:

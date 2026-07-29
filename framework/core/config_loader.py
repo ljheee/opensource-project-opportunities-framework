@@ -125,6 +125,14 @@ class ConfigLoader:
             'max_per_day': _pos_int('backfill_max_per_day', 50),
         }
 
+    def get_structure_max_per_day(self) -> int:
+        raw = ((self.load().get('sources') or {}).get('github') or {}).get('structure_max_per_day', 50)
+        try:
+            val = int(raw)
+        except (ValueError, TypeError):
+            return 50
+        return val if val > 0 else 50
+
     def get_ecosystems(self) -> List[str]:
         ecosystems = (self.load().get('sources') or {}).get('ecosystems', [])
         return ecosystems if isinstance(ecosystems, list) else []
