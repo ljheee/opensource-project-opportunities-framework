@@ -545,6 +545,57 @@ def _format_prompt(template: str, values: Dict[str, str]) -> str:
     return pattern.sub(lambda m: str(values.get(m.group(1), m.group(0))), template)
 
 
+def _format_structure_facts(structure: Optional[Dict]) -> str:
+    if not structure:
+        return '_No structural facts available._'
+    lines = [
+        f"- has_tests: {structure.get('has_tests')}, has_ci: {structure.get('has_ci')}, "
+        f"has_docs: {structure.get('has_docs')}, has_examples: {structure.get('has_examples')}",
+        f"- dependencies ({len(structure.get('dependencies') or [])}): "
+        + ', '.join((structure.get('dependencies') or [])[:30]),
+        f"- matched_ecosystem_packages: {', '.join(structure.get('matched_ecosystem_packages') or []) or 'none'}",
+        f"- core_paths: {', '.join(structure.get('core_paths') or []) or 'none'}"
+        + (f" ({structure.get('core_paths_reason')})" if structure.get('core_paths_reason') else ''),
+    ]
+    ih = structure.get('issue_health')
+    if ih:
+        lines.append(
+            f"- issue_health: reaction_total={ih.get('reaction_total')}, "
+            f"avg_comments={ih.get('avg_comments')}, active_issues_30d={ih.get('active_issues_30d')}"
+        )
+    if structure.get('partial'):
+        lines.append('- NOTE: repo file tree was truncated by GitHub; facts are root-level only.')
+    return '\n'.join(lines)
+
+
+def _format_core_excerpts(excerpts: Optional[List]) -> str:
+    if not excerpts:
+        return '_No core implementation excerpts available._'
+    parts = []
+    for e in excerpts[:3]:
+        # Four-backtick fences: file content itself may contain triple backticks (review fix)
+        parts.append(f"### {e.get('path')}\n````\n{e.get('content')}\n````")
+    return '\n\n'.join(parts)
+
+
+def _format_community_signals(structure: Optional[Dict]) -> str:
+    if not structure:
+        return '_No community signals available._'
+    ih = structure.get('issue_health')
+    top = structure.get('top_issues') or []
+    if ih is None and not top:
+        return '_No community signals available (issues disabled or fetch failed)._'
+    lines = []
+    if ih:
+        lines.append(
+            f"Issue stats: reaction_total={ih.get('reaction_total')}, "
+            f"avg_comments={ih.get('avg_comments')}, active_issues_30d={ih.get('active_issues_30d')}"
+        )
+    for i, t in enumerate(top, 1):
+        lines.append(f"{i}. [{t.get('reactions', 0)} reactions, {t.get('comments', 0)} comments] {t.get('title')}")
+    return '\n'.join(lines) if lines else '_No community signals available._'
+
+
 def generate_analysis_with_llm(project: Dict, cli_tool: str,
                                 resilience_config: Optional[Dict] = None) -> Optional[Dict]:
     """Generate analysis using LLM via CLI tool."""
@@ -648,6 +699,9 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
         'peer_comparison': peer_comparison,
         'inflection_analysis': inflection_analysis,
         'readme_excerpt': project.get('readme') or '_README unavailable._',
+        'structure_facts': _format_structure_facts(project.get('structure')),
+        'core_implementation': _format_core_excerpts(project.get('core_excerpts')),
+        'community_signals': _format_community_signals(project.get('structure')),
     })
 
     try:
