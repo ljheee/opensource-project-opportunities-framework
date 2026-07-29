@@ -60,6 +60,7 @@ class DiscoverStage:
         self.star_min, self.star_max = config.get_star_range()
         self.created_within_days = config.get_created_within_days()
         self._backfills_done = 0
+        self._structures_done = 0
 
     def _github_request(self, url: str, params: Optional[Dict] = None,
                        is_search: bool = False, headers: Optional[Dict] = None) -> Dict:
@@ -707,6 +708,79 @@ class DiscoverStage:
         facts['top_issues'] = top
         return facts
 
+    def _structure_within_budget(self, project_id: str, conn) -> Optional[Dict]:
+        """Fetch L1 structure facts for one project if due and within budget.
+
+        Returns the facts dict if freshly fetched this call, else None.
+        Freshness: structure_json missing / fetched_at NULL / fetched_at older
+        than 10 days. Failure gating: 3 consecutive failures -> skip for 30 days.
+        """
+        row = conn.execute(
+            'SELECT structure_json FROM projects WHERE id = ?', (project_id,)
+        ).fetchone()
+        existing = None
+        if row and row['structure_json']:
+            try:
+                existing = json.loads(row['structure_json'])
+            except (json.JSONDecodeError, TypeError):
+                existing = None
+        now = datetime.now(timezone.utc)
+        if existing and existing.get('fetched_at'):
+            try:
+                fetched = datetime.fromisoformat(str(existing['fetched_at']).replace('Z', '+00:00'))
+                if fetched.tzinfo is None:
+                    fetched = fetched.replace(tzinfo=timezone.utc)
+                if (now - fetched).days < 10:
+                    return None  # fresh enough
+            except (ValueError, TypeError):
+                pass
+        # Failure gating: 3 consecutive failures -> 30-day cooldown
+        if existing and not existing.get('fetched_at'):
+            try:
+                fail_count = int(existing.get('fail_count') or 0)
+            except (ValueError, TypeError):
+                fail_count = 0
+            last_fail = existing.get('last_fail_at')
+            if fail_count >= 3 and last_fail:
+                try:
+                    lf = datetime.fromisoformat(str(last_fail).replace('Z', '+00:00'))
+                    if lf.tzinfo is None:
+                        lf = lf.replace(tzinfo=timezone.utc)
+                    if (now - lf).days < 30:
+                        return None
+                except (ValueError, TypeError):
+                    pass
+        budget = self.config.get_structure_max_per_day()
+        if self._structures_done >= budget:
+            return None
+        facts = self._fetch_structure_facts(project_id)
+        self._structures_done += 1
+        if facts is None:
+            prev_fail = 0
+            if existing:
+                try:
+                    prev_fail = int(existing.get('fail_count') or 0)
+                except (ValueError, TypeError):
+                    prev_fail = 0
+            # 保留旧的成功事实（若存在），只更新失败计数——刷新失败
+            # 不应销毁仍可用的旧数据（review 修正）
+            failure_record = dict(existing) if existing else {}
+            failure_record['fetched_at'] = (existing or {}).get('fetched_at')
+            failure_record['fail_count'] = prev_fail + 1
+            failure_record['last_fail_at'] = now.isoformat()
+            conn.execute(
+                'UPDATE projects SET structure_json = ? WHERE id = ?',
+                (json.dumps(failure_record, ensure_ascii=False), project_id)
+            )
+            return None
+        facts['fetched_at'] = now.isoformat()
+        facts['fail_count'] = 0
+        conn.execute(
+            'UPDATE projects SET structure_json = ? WHERE id = ?',
+            (json.dumps(facts, ensure_ascii=False), project_id)
+        )
+        return facts
+
     def _calculate_and_store_burst_score(self, project_id: str, conn=None):
         """Calculate early-burst score from sampled data."""
         should_close = conn is None
@@ -790,6 +864,7 @@ class DiscoverStage:
                 open_issues = int(proj['open_issues']) if proj['open_issues'] is not None else 0
             except (ValueError, TypeError):
                 open_issues = 0
+            fresh_facts = self._structure_within_budget(project_id, conn)
             activity_score = self.scoring.calculate_activity_index(
                 open_issues, commit_frequency
             )
