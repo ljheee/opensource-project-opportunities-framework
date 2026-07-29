@@ -27,13 +27,13 @@
 - **算术闭合**（review 修正）：稳态每天 = 250 存量 ÷ 10 天 + ~20 新发现 ≈ 45 < 50；存量补完约 5-9 天（取决于新发现竞争量），不用"1 周补完"的承诺口径
 - 连续失败项目（repo 删除/改名导致 tree 404）：同一项目连续 3 次失败后，30 天内不再重试（失败计数存 structure_json 的 `fail_count`，成功即清零）
 
-### 2.2 采集内容（约 2 次 API 调用/项目 + raw 免费抓取）
+### 2.2 采集内容（约 3 次 API 调用/项目 + raw 免费抓取）
 
 | 素材 | 调用 | 提取的骨架事实 |
 |---|---|---|
 | `GET /repos/{}/git/trees/HEAD?recursive=1` | 1 次 API | 见下方 2.3 各字段。**必须检查响应的 `truncated` 标志**（大仓库超 100k 条目会截断） |
 | 清单文件内容 | raw.githubusercontent.com（不占 API 限额） | `dependencies` 列表；`matched_ecosystem_packages`：依赖与 `filters.known_ecosystem_packages` 的交集（**传原始事实，不传布尔结论**——见 2.4） |
-| `GET /repos/{}/issues?state=all&sort=comments&direction=desc&per_page=10` | 1 次 API | 见下方 `issue_health`。**必须过滤含 `pull_request` 键的条目**（该端点同时返回 PR） |
+| `GET /repos/{}/issues?state=all&sort=comments&direction=desc&per_page=10` | 1 次 API（外加 1 次 repo 元数据调用读取 `has_issues`） | 见下方 `issue_health`。**必须过滤含 `pull_request` 键的条目**（该端点同时返回 PR） |
 
 ### 2.3 骨架事实字段定义
 
@@ -135,10 +135,10 @@ Top Opportunities 区不变；early-burst 项目区不加新展示（YAGNI）。
 
 | 项 | 计算 | 调用数 |
 |---|---|---|
-| L1 结构判读 | ≤50 预算 × ~2 次 API（清单文件走 raw 免费） | ≤100 |
+| L1 结构判读 | ≤50 预算 × ~3 次 API（tree + repo 元数据 + issues；清单文件走 raw 免费） | ≤150 |
 | L2 核心文件 + 社区信号 | 核心文件走 raw 免费；社区信号读 structure_json | ≈0 |
 | 现有开销（前 spec §2.5） | topics / ecosystem / trending / backfill / commits / README | ~400-500 |
-| **合计** | | **~500-600**，限额内宽裕 |
+| **合计** | | **~550-700**，限额内宽裕 |
 
 raw 抓取量：incremental 15 项目 × 3 文件 = 45/天；bulk 模式按 `scheduling.bulk.batch_size`（20）= 60/天，均在 GitHub 页面层限流安全区。
 

@@ -236,8 +236,13 @@ Expected: FAIL — `AssertionError: method missing`
     def _parse_tree(self, tree_entries: List[Dict], partial: bool) -> Dict:
         """Extract structural facts from tree entries."""
         paths = [e for e in tree_entries if isinstance(e, dict) and e.get('type') == 'blob']
+        # 目录条目（type='tree'）也要收集：根目录降级（partial）路径下，
+        # 目录存在性判断完全依赖它们（review 修正：只收 blob 会导致
+        # partial 时 has_tests/has_docs 等恒为 False）
+        root_dirs = {e['path'].lower() for e in tree_entries
+                     if isinstance(e, dict) and e.get('type') == 'tree' and '/' not in (e.get('path') or '')}
         all_paths = [e.get('path') or '' for e in paths]
-        dirs = {p.split('/')[0].lower() for p in all_paths if p}
+        dirs = {p.split('/')[0].lower() for p in all_paths if p} | root_dirs
         facts = {
             'has_tests': any(d in dirs for d in ('tests', 'test')) or any(p.lower().startswith(('tests/', 'test/')) for p in all_paths),
             'has_ci': any(p.lower().startswith('.github/workflows/') for p in all_paths),
@@ -285,21 +290,49 @@ Expected: FAIL — `AssertionError: method missing`
                 deps = []
         elif manifest_path in ('Cargo.toml', 'pyproject.toml'):
             in_deps = False
+            array_continues = False
             for line in text.splitlines():
                 ls = line.strip()
-                if ls.startswith('['):
-                    in_deps = ls.rstrip(']').rstrip('"').endswith(('dependencies', 'dependencies]'))
-                elif in_deps and ls and not ls.startswith('#'):
-                    name = re.split(r'[\s=\[("\'><~^]', ls, maxsplit=1)[0].strip().strip('"\'')
-                    if name and re.match(r'^[A-Za-z0-9_.-]+$', name):
-                        deps.append(name)
-        else:  # requirements.txt / go.mod — one module per line
+                if ls.startswith('[') and ls.endswith(']') and '=' not in ls:
+                    # 段头：[dependencies] / [project] / [tool.poetry.dependencies] 等
+                    in_deps = 'dependencies' in ls and 'optional-dependencies' not in ls and 'dev-dependencies' not in ls
+                    array_continues = False
+                    continue
+                if in_deps:
+                    # PEP 621: [project] 段内 dependencies = ["a", "b"] 可能跨行
+                    if ls.startswith('dependencies') and '=' in ls:
+                        array_continues = '[' in ls and ']' not in ls
+                        names = re.findall(r'"([A-Za-z0-9_.-]+)"', ls)
+                        deps.extend(names)
+                        continue
+                    if array_continues:
+                        names = re.findall(r'"([A-Za-z0-9_.-]+)"', ls)
+                        deps.extend(names)
+                        if ']' in ls:
+                            array_continues = False
+                        continue
+                    if ls and not ls.startswith('#') and '=' in ls:
+                        name = re.split(r'[\s=\[("\'><~^]', ls, maxsplit=1)[0].strip().strip('"\'')
+                        if name and re.match(r'^[A-Za-z0-9_.-]+$', name) and name != 'dependencies':
+                            deps.append(name)
+        elif manifest_path == 'go.mod':
             for line in text.splitlines():
                 ls = line.strip()
-                if not ls or ls.startswith(('#', '//')):
+                if not ls or ls.startswith('//'):
+                    continue
+                first = ls.split()[0] if ls.split() else ''
+                if first in ('module', 'go', 'require', 'replace', 'exclude', ')', '('):
+                    continue
+                name = first.strip()
+                if name and re.match(r'^[A-Za-z0-9_./-]+$', name):
+                    deps.append(name)
+        else:  # requirements.txt
+            for line in text.splitlines():
+                ls = line.strip()
+                if not ls or ls.startswith(('#', '-')):
                     continue
                 name = re.split(r'[\s=><~^(;]', ls, maxsplit=1)[0].strip()
-                if name and re.match(r'^[A-Za-z0-9_./-]+$', name):
+                if name and re.match(r'^[A-Za-z0-9_.-]+$', name):
                     deps.append(name)
         eco = self.config.get_filters().get('known_ecosystem_packages', [])
         if not isinstance(eco, list):
@@ -504,10 +537,15 @@ git commit -m "feat: L1 structural facts fetcher (tree, manifest deps, issue hea
                     prev_fail = int(existing.get('fail_count') or 0)
                 except (ValueError, TypeError):
                     prev_fail = 0
+            # 保留旧的成功事实（若存在），只更新失败计数——刷新失败
+            # 不应销毁仍可用的旧数据（review 修正）
+            failure_record = dict(existing) if existing else {}
+            failure_record['fetched_at'] = (existing or {}).get('fetched_at')
+            failure_record['fail_count'] = prev_fail + 1
+            failure_record['last_fail_at'] = now.isoformat()
             conn.execute(
                 'UPDATE projects SET structure_json = ? WHERE id = ?',
-                (json.dumps({'fetched_at': None, 'fail_count': prev_fail + 1,
-                             'last_fail_at': now.isoformat()}), project_id)
+                (json.dumps(failure_record, ensure_ascii=False), project_id)
             )
             return None
         facts['fetched_at'] = now.isoformat()
@@ -521,13 +559,13 @@ git commit -m "feat: L1 structural facts fetcher (tree, manifest deps, issue hea
 
 - [ ] **Step 3: 评分流程接线**
 
-`_calculate_and_store_burst_score` 中，contributors 实采块之后插入一行：
+`_calculate_and_store_burst_score` 中，**open_issues 解析块之后、activity 计算之前**插入一行（review 修正：原位置在 activity 调用点之后会造成 NameError）：
 
 ```python
             fresh_facts = self._structure_within_budget(project_id, conn)
 ```
 
-（排队说明：本任务按 run() 既有顺序处理——新项目 store 循环在前、存量循环在后，故新发现项目自然优先，满足 spec §2.1 的排队意图；存量按表序而非显式 fetched_at 排序，在 10 天刷新周期下差异可忽略。`fresh_facts` 变量供 Task 7 的评分接线使用。）
+（排队说明：本任务按 run() 既有顺序处理——新项目 store 循环在前、存量循环在后，故新发现项目自然优先。**已知偏离（spec §2.1 排队条款）**：存量按表序而非显式 fetched_at 最旧优先，接受理由：10 天刷新周期下偏差 ≤1 天，影响可忽略。预算计数语义：**无论成败均计预算**（防限流保护，与 backfill 仅成功计数不同，属有意为之——失败项目重试也消耗 API）。`fresh_facts` 变量供 Task 7 的评分接线使用。）
 
 - [ ] **Step 4: 逻辑验证（monkeypatch，无网络）**
 
@@ -547,20 +585,28 @@ s = DiscoverStage(ConfigLoader(), Database())
 calls = []
 s._fetch_structure_facts = lambda pid: calls.append(pid) or {'has_tests': True, 'issue_health': None, 'top_issues': []} if pid != 'a/p2' else None
 
-# 预算内：3 个项目都应尝试（p2 模拟失败）
+# 预算内：p0/p1 成功采集；p2 因预算耗尽（budget=2）不被尝试
 s.config.get_structure_max_per_day = lambda: 2
 r0 = s._structure_within_budget('a/p0', conn)
 r1 = s._structure_within_budget('a/p1', conn)
-r2 = s._structure_within_budget('a/p2', conn)  # 超预算（budget=2），不尝试
+r2 = s._structure_within_budget('a/p2', conn)
 assert r0 is not None and r0['has_tests'] is True
 assert r1 is not None
 assert r2 is None and 'a/p2' not in calls, calls
+# 失败路径：恢复预算，让 p2 真实失败一次，fail_count=1 写库且保留语义正确
+s.config.get_structure_max_per_day = lambda: 50
+calls.clear()
+r2b = s._structure_within_budget('a/p2', conn)
+assert r2b is None and 'a/p2' in calls
+import json as j
+row = conn.execute("SELECT structure_json FROM projects WHERE id='a/p2'").fetchone()
+assert j.loads(row['structure_json'])['fail_count'] == 1, row['structure_json']
 # 新鲜度：p0 刚采集过，再调应跳过
 assert s._structure_within_budget('a/p0', conn) is None
 # 失败计数：手工制造 3 次失败后应 30 天不重试
-import json as j
+from datetime import datetime as _dt, timezone as _tz
 conn.execute("UPDATE projects SET structure_json = ? WHERE id = 'a/p2'",
-             (j.dumps({'fetched_at': None, 'fail_count': 3, 'last_fail_at': '2026-07-29T00:00:00+00:00'}),))
+             (j.dumps({'fetched_at': None, 'fail_count': 3, 'last_fail_at': _dt.now(_tz).isoformat()}),))
 conn.commit()
 s._structures_done = 0
 assert s._structure_within_budget('a/p2', conn) is None and 'a/p2' not in calls[2:]
@@ -774,7 +820,8 @@ def _format_core_excerpts(excerpts: Optional[List]) -> str:
         return '_No core implementation excerpts available._'
     parts = []
     for e in excerpts[:3]:
-        parts.append(f"### {e.get('path')}\n```\n{e.get('content')}\n```")
+        # 四反引号围栏：文件内容本身可能含三反引号（review 修正）
+        parts.append(f"### {e.get('path')}\n````\n{e.get('content')}\n````")
     return '\n\n'.join(parts)
 
 
@@ -853,6 +900,12 @@ analysis2 = {'innovation_evidence': ['fake/file.py x'], 'problem_evidence': [], 
 c2, m2 = _validate_evidence(analysis2, structure)
 assert c2['innovation_evidence'] == [] and c2['confidence'] == 'low'
 assert 'innovation_summary' in c2['cannot_determine'], c2
+# 无参考集（partial/no_match）→ 不放行，记 unverifiable
+c3, m3 = _validate_evidence(
+    {'innovation_evidence': ['anything.py does x'], 'problem_evidence': [], 'confidence': 'high', 'cannot_determine': []},
+    {'core_paths': [], 'top_issues': []})
+assert c3['innovation_evidence'] == [] and c3['confidence'] == 'low'
+assert m3.get('unverifiable_innovation') == 1, m3
 print('evidence validation OK')
 EOF
 ```
@@ -888,30 +941,36 @@ def _validate_evidence(analysis: Dict, structure: Optional[Dict]) -> Tuple[Dict,
 
     inno = cleaned.get('innovation_evidence') or []
     prob = cleaned.get('problem_evidence') or []
-    if file_tokens:
-        kept_inno = [e for e in inno if isinstance(e, str) and _evidence_matches(e, file_tokens)]
-    else:
-        kept_inno = [] if inno else inno  # no reference set: keep as-is (unverifiable, LLM told to mark cannot_determine)
-    if title_tokens:
-        kept_prob = [e for e in prob if isinstance(e, str) and _evidence_matches(e, title_tokens)]
-    else:
-        kept_prob = [] if prob else prob
-    meta = {
-        'stripped_innovation': len(inno) - len(kept_inno) if file_tokens else 0,
-        'stripped_problem': len(prob) - len(kept_prob) if title_tokens else 0,
-    }
-    cleaned['innovation_evidence'] = kept_inno
-    cleaned['problem_evidence'] = kept_prob
-
     cd = cleaned.get('cannot_determine') or []
     if not isinstance(cd, list):
         cd = []
     cd = list(cd)
-    if file_tokens and inno and not kept_inno:
+    meta = {'stripped_innovation': 0, 'stripped_problem': 0}
+
+    # 无参考集（partial/no_match/未采集）时无法验证 → 一律剔除并降级，
+    # 与"幻觉引用不放行"的保守方向一致（review 修正：原设计放行）
+    if file_tokens:
+        kept_inno = [e for e in inno if isinstance(e, str) and _evidence_matches(e, file_tokens)]
+        meta['stripped_innovation'] = len(inno) - len(kept_inno)
+    else:
+        kept_inno = []
+        if inno:
+            meta['unverifiable_innovation'] = len(inno)
+    if title_tokens:
+        kept_prob = [e for e in prob if isinstance(e, str) and _evidence_matches(e, title_tokens)]
+        meta['stripped_problem'] = len(prob) - len(kept_prob)
+    else:
+        kept_prob = []
+        if prob:
+            meta['unverifiable_problem'] = len(prob)
+    cleaned['innovation_evidence'] = kept_inno
+    cleaned['problem_evidence'] = kept_prob
+
+    if inno and not kept_inno:
         cleaned['confidence'] = 'low'
         if 'innovation_summary' not in cd:
             cd.append('innovation_summary')
-    if title_tokens and prob and not kept_prob:
+    if prob and not kept_prob:
         cleaned['confidence'] = 'low'
         if 'problem_solved' not in cd:
             cd.append('problem_solved')
@@ -1008,7 +1067,7 @@ print('scoring OK', hot, cold, none)
 "
 ```
 
-Expected: FAIL — `TypeError: calculate_buzz() missing` 或 activity 参数报错
+Expected: FAIL — `AttributeError: 'ScoringEngine' object has no attribute 'calculate_buzz'` 或 activity 参数 TypeError
 
 - [ ] **Step 2: scoring_engine 实现**
 
@@ -1111,7 +1170,7 @@ git commit -m "feat: revive buzz as real signal, enhance activity with tests/CI 
 
 - [ ] **V1**: L1 真实采集：`python3 framework/stages/discover.py`（后台），日志出现 structure 采集且预算 ≤50；`sqlite3 data/framework.db "SELECT COUNT(*) FROM projects WHERE structure_json IS NOT NULL;"` > 0；抽查 3 个项目 structure_json 字段合理。另用 `PYTHONPATH=. python3 -c` 驱动 `_fetch_structure_facts` 打一个已知大型 monorepo（如 `microsoft/vscode`），断言返回 dict 的 `partial` 为 True 且 `core_paths == []`（truncated 降级负例，spec §7 验证项 1）
 - [ ] **V2**: L1 幂等：同日二次跑 discover，`structure_json` 的 fetched_at 不变（不重复采集）
-- [ ] **V3**: L2 程序化断言（spec §7 验证项 3）：`USE_LLM=true CLI_TOOL="claude --dangerously-skip-permissions" python3 framework/stages/analyze.py --date $(date -u +%Y-%m-%d) --use-llm --max-tasks 3` 后——
+- [ ] **V3**: L2 程序化断言（spec §7 验证项 3）：`USE_LLM=true CLI_TOOL="claude --dangerously-skip-permissions" python3 framework/stages/analyze.py --date $(date -u +%Y-%m-%d) --use-llm --max-tasks 3` 后——若 3 个任务都有 core_paths，先手动挑 1 个 `core_paths_reason='no_match'` 的项目补跑（保证覆盖无参考集路径）：
 
 ```bash
 PYTHONPATH=. python3 - <<'EOF'
@@ -1121,9 +1180,10 @@ conn = Database().get_conn()
 rows = conn.execute("""
     SELECT a.evidence_json, p.structure_json FROM analyses a
     JOIN projects p ON a.project_id = p.id
-    WHERE a.analyzer_version = 'llm-v1' ORDER BY a.id DESC LIMIT 3
+    WHERE a.analyzer_version = 'llm-v1' AND a.evidence_json IS NOT NULL
+    ORDER BY a.id DESC LIMIT 3
 """).fetchall()
-assert rows, 'no llm-v1 analyses'
+assert rows, 'no llm-v1 analyses with evidence'
 for r in rows:
     ev = json.loads(r['evidence_json'])
     for k in ('innovation_evidence', 'problem_evidence', 'confidence', 'cannot_determine', 'validation'):
@@ -1141,7 +1201,7 @@ EOF
 ```
 
 Expected: 输出 `L2 evidence assertions OK`
-- [ ] **V4**: 反哺对比：挑 1 个已有 L1 数据的项目，对比其 buzz_source=real 的最新评分与历史 fallback 评分
+- [ ] **V4**: 反哺对比：挑 1 个已有 L1 数据的项目，对比其 buzz_source=real 的最新评分与历史 fallback 评分。注意：early_burst_signals 表中混存旧权重（0.45/0.35/0.0/0.20）与新权重（0.40/0.30/0.10/0.20）两个 regime 的行，横向对比整体分时注意口径（prediction_outcomes 实测 0 行，闭环不受影响）
 - [ ] **V5**: `reweight.py --dry-run`、`validate.py --metrics-only` 不崩
 - [ ] **V6**: 速率消耗观察：discover 日志无 rate limit 长等待
 
