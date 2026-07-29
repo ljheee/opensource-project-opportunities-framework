@@ -334,7 +334,8 @@ def validate_opportunity(opp: Dict) -> Tuple[bool, str]:
 
 
 def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Dict, conn=None,
-                                     analyzer_version: str = 'llm-v1') -> int:
+                                     analyzer_version: str = 'llm-v1',
+                                     evidence: Optional[Dict] = None) -> int:
     """Store analysis results and opportunities atomically."""
     should_close = conn is None
     conn = conn or db.get_conn()
@@ -349,8 +350,8 @@ def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Di
                 project_id, analyzed_at, tech_layer, application,
                 problem_solved, innovation_summary, differentiation,
                 market_timing, ecosystem_position, commercialization_path,
-                overall_score, analyzer_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                overall_score, analyzer_version, evidence_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             project_id, now,
             analysis.get('tech_layer') or '',
@@ -362,7 +363,8 @@ def store_analysis_and_opportunities(db: Database, project_id: str, analysis: Di
             analysis.get('ecosystem_position') or '',
             analysis.get('commercialization_path') or '',
             analysis.get('overall_score', 5),
-            analyzer_version
+            analyzer_version,
+            json.dumps(evidence, ensure_ascii=False) if evidence else None
         ))
 
         # Store opportunities
@@ -527,12 +529,80 @@ def validate_analysis_output(analysis: Dict) -> Tuple[bool, str, Dict]:
         score = 5
     cleaned['overall_score'] = min(10, max(1, score))
 
+    # Evidence contract fields (format only; membership checked by _validate_evidence)
+    for field in ('innovation_evidence', 'problem_evidence', 'cannot_determine'):
+        if not isinstance(cleaned.get(field), list):
+            cleaned[field] = []
+    if cleaned.get('confidence') not in ('high', 'medium', 'low'):
+        cleaned['confidence'] = 'medium'
+
     # Ensure opportunities is a list
     opportunities = cleaned.get('opportunities')
     if not isinstance(opportunities, list):
         cleaned['opportunities'] = []
 
     return True, "", cleaned
+
+
+def _evidence_matches(text: str, candidates: List[str]) -> bool:
+    """True if any candidate token appears in the evidence string."""
+    low = text.lower()
+    return any(c.lower() in low for c in candidates if c)
+
+
+def _validate_evidence(analysis: Dict, structure: Optional[Dict]) -> Tuple[Dict, Dict]:
+    """Deterministic membership check for LLM-cited evidence (hallucination guard).
+
+    - innovation_evidence items must mention a file from core_paths (or its basename)
+    - problem_evidence items must mention a real top_issues title (substring)
+    - stripped-to-empty innovation list -> confidence='low' + 'innovation_summary'
+      appended to cannot_determine (same for problem_solved)
+    Returns (cleaned_analysis, validation_meta).
+    """
+    cleaned = dict(analysis)
+    structure = structure or {}
+    core_paths = structure.get('core_paths') or []
+    file_tokens = list(core_paths) + [p.rsplit('/', 1)[-1] for p in core_paths if '/' in p]
+    issue_titles = [(t.get('title') or '') for t in (structure.get('top_issues') or [])]
+    title_tokens = [t for t in issue_titles if len(t) >= 8]
+
+    inno = cleaned.get('innovation_evidence') or []
+    prob = cleaned.get('problem_evidence') or []
+    cd = cleaned.get('cannot_determine') or []
+    if not isinstance(cd, list):
+        cd = []
+    cd = list(cd)
+    meta = {'stripped_innovation': 0, 'stripped_problem': 0}
+
+    # 无参考集（partial/no_match/未采集）时无法验证 → 一律剔除并降级，
+    # 与"幻觉引用不放行"的保守方向一致（review 修正：原设计放行）
+    if file_tokens:
+        kept_inno = [e for e in inno if isinstance(e, str) and _evidence_matches(e, file_tokens)]
+        meta['stripped_innovation'] = len(inno) - len(kept_inno)
+    else:
+        kept_inno = []
+        if inno:
+            meta['unverifiable_innovation'] = len(inno)
+    if title_tokens:
+        kept_prob = [e for e in prob if isinstance(e, str) and _evidence_matches(e, title_tokens)]
+        meta['stripped_problem'] = len(prob) - len(kept_prob)
+    else:
+        kept_prob = []
+        if prob:
+            meta['unverifiable_problem'] = len(prob)
+    cleaned['innovation_evidence'] = kept_inno
+    cleaned['problem_evidence'] = kept_prob
+
+    if inno and not kept_inno:
+        cleaned['confidence'] = 'low'
+        if 'innovation_summary' not in cd:
+            cd.append('innovation_summary')
+    if prob and not kept_prob:
+        cleaned['confidence'] = 'low'
+        if 'problem_solved' not in cd:
+            cd.append('problem_solved')
+    cleaned['cannot_determine'] = cd
+    return cleaned, meta
 
 
 def _format_prompt(template: str, values: Dict[str, str]) -> str:
@@ -784,6 +854,9 @@ def generate_analysis_with_llm(project: Dict, cli_tool: str,
                         continue
                     return None
 
+                analysis, evidence_meta = _validate_evidence(analysis, project.get('structure'))
+                analysis['_evidence_meta'] = evidence_meta
+
                 return analysis
 
             except (subprocess.SubprocessError, OSError) as e:
@@ -912,8 +985,18 @@ def run_analysis(db: Database, scheduler: Scheduler, date: str,
                 analyzer_version = 'heuristic-v1'
 
             # Store analysis and opportunities atomically (shared conn)
+            evidence = None
+            if analyzer_version == 'llm-v1':
+                evidence = {
+                    'innovation_evidence': analysis.get('innovation_evidence') or [],
+                    'problem_evidence': analysis.get('problem_evidence') or [],
+                    'confidence': analysis.get('confidence') or 'medium',
+                    'cannot_determine': analysis.get('cannot_determine') or [],
+                    'validation': analysis.get('_evidence_meta') or {},
+                }
             opportunities_count = store_analysis_and_opportunities(
-                db, project_id, analysis, conn=conn, analyzer_version=analyzer_version
+                db, project_id, analysis, conn=conn, analyzer_version=analyzer_version,
+                evidence=evidence
             )
 
             # Mark task complete and project as active (same transaction)
