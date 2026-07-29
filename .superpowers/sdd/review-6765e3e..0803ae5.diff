@@ -1,0 +1,102 @@
+# Review package: 6765e3e..HEAD~1
+
+## Commits
+0803ae5 feat: incremental scheduling uses cooldown + change trigger instead of daily re-analysis
+
+## Files changed
+ framework/core/scheduler.py | 44 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 43 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/framework/core/scheduler.py b/framework/core/scheduler.py
+index e1fddbd..29365c1 100644
+--- a/framework/core/scheduler.py
++++ b/framework/core/scheduler.py
+@@ -67,20 +67,34 @@ class Scheduler:
+                     continue
+ 
+             conn.commit()
+             return count
+         finally:
+             conn.close()
+ 
+     def generate_incremental_tasks(self, date: str, max_tasks: int) -> int:
+         if max_tasks <= 0:
+             return 0
++        inc = (self.config or {}).get('incremental') or {}
++        try:
++            star_threshold = float(inc.get('star_change_threshold', 0.05))
++        except (ValueError, TypeError):
++            star_threshold = 0.05
++        try:
++            recent_commit_days = int(inc.get('recent_commit_days', 3))
++        except (ValueError, TypeError):
++            recent_commit_days = 3
++        try:
++            cooldown_days = int(inc.get('min_reanalyze_days', 7))
++        except (ValueError, TypeError):
++            cooldown_days = 7
++
+         conn = self.get_conn()
+         try:
+             cur = conn.execute('''
+                 SELECT p.id, COALESCE(e.overall_score, 0.5) as burst_score
+                 FROM projects p
+                 LEFT JOIN (
+                     SELECT project_id, overall_score,
+                            ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY calculated_at DESC) as rn
+                     FROM early_burst_signals
+                 ) e ON p.id = e.project_id AND e.rn = 1
+@@ -89,23 +103,51 @@ class Scheduler:
+                     SELECT 1 FROM tasks t
+                     WHERE t.project_id = p.id
+                     AND t.task_type = 'incremental'
+                     AND t.task_date = ?
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM tasks t
+                     WHERE t.project_id = p.id
+                     AND t.status IN ('pending', 'running')
+                 )
++                AND (
++                    -- Never analyzed: always eligible
++                    NOT EXISTS (SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.status = 'done')
++                    OR (
++                        -- Cooldown elapsed since last analysis.
++                        -- datetime() normalizes ISO 'T...+00:00' to SQLite 'YYYY-MM-DD HH:MM:SS';
++                        -- COALESCE prevents starvation when a done task exists but analyses rows are gone.
++                        COALESCE(
++                            datetime((SELECT MAX(a.analyzed_at) FROM analyses a WHERE a.project_id = p.id)),
++                            '1970-01-01'
++                        ) <= datetime('now', '-' || ? || ' days')
++                        AND (
++                            -- 7-day star growth >= threshold (unknown history -> not satisfied)
++                            (
++                                SELECT CASE WHEN h.old_stars > 0
++                                       THEN (CAST(p.stars AS REAL) - h.old_stars) / h.old_stars
++                                       ELSE 0 END
++                                FROM (
++                                    SELECT stars as old_stars FROM star_history
++                                    WHERE project_id = p.id
++                                      AND sampled_at <= date('now', '-7 days')
++                                    ORDER BY sampled_at DESC LIMIT 1
++                                ) h
++                            ) >= ?
++                            OR datetime(p.last_commit_at) >= datetime('now', '-' || ? || ' days')
++                        )
++                    )
++                )
+                 ORDER BY burst_score DESC, p.stars DESC, p.id ASC
+                 LIMIT ?
+-            ''', (date, max_tasks))
++            ''', (date, cooldown_days, star_threshold, recent_commit_days, max_tasks))
+ 
+             count = 0
+             for row in cur.fetchall():
+                 try:
+                     conn.execute('''
+                         INSERT INTO tasks (project_id, task_date, task_type,
+                             priority_score, trigger_reason, status, created_at)
+                         VALUES (?, ?, 'incremental', ?, 'new_discovery', 'pending', ?)
+                     ''', (row['id'], date, row['burst_score'],
+                           datetime.now(timezone.utc).isoformat()))

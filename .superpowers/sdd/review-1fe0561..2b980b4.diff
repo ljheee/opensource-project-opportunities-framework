@@ -1,0 +1,70 @@
+# Review package: 1fe0561..HEAD
+
+## Commits
+2b980b4 fix: drop community_buzz from reweight components, make backtest component-driven
+
+## Files changed
+ framework/stages/reweight.py | 11 ++++-------
+ 1 file changed, 4 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/framework/stages/reweight.py b/framework/stages/reweight.py
+index de475c2..dba89d6 100755
+--- a/framework/stages/reweight.py
++++ b/framework/stages/reweight.py
+@@ -10,25 +10,24 @@ import os
+ import sys
+ import argparse
+ import shutil
+ import yaml
+ from datetime import datetime
+ 
+ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+ 
+ from framework.core.db import Database
+ 
+-COMPONENTS = ['star_velocity', 'activity_index', 'community_buzz', 'novelty_signal']
++COMPONENTS = ['star_velocity', 'activity_index', 'novelty_signal']
+ COMPONENT_COLS = {
+     'star_velocity': 'star_velocity_at_pred',
+     'activity_index': 'activity_index_at_pred',
+-    'community_buzz': 'community_buzz_at_pred',
+     'novelty_signal': 'novelty_at_pred',
+ }
+ 
+ 
+ def _correlation(x, y):
+     """Pearson correlation coefficient (Python 3.9 compat)."""
+     n = len(x)
+     if n < 2 or len(y) != n:
+         return None
+     mean_x = sum(x) / n
+@@ -219,25 +218,23 @@ def propose_new_min_score(threshold_results):
+             return tr['threshold']
+     # Default: keep current if no threshold hits 65%
+     return None
+ 
+ 
+ def backtest(rows, new_weights, new_min_score):
+     """Re-score historical predictions with new weights and threshold."""
+     tp_new = 0
+     fp_new = 0
+     for r in rows:
+-        new_score = (
+-            (r['star_velocity_at_pred'] or 0) * new_weights['star_velocity'] +
+-            (r['activity_index_at_pred'] or 0) * new_weights['activity_index'] +
+-            (r['community_buzz_at_pred'] or 0) * new_weights['community_buzz'] +
+-            (r['novelty_at_pred'] or 0) * new_weights['novelty_signal']
++        new_score = sum(
++            (r.get(COMPONENT_COLS[c]) or 0) * new_weights.get(c, 0)
++            for c in COMPONENTS
+         )
+         predicted_burst = new_score >= new_min_score
+         actual_positive = r['outcome'] == 'true_positive'
+         if predicted_burst and actual_positive:
+             tp_new += 1
+         elif predicted_burst and not actual_positive:
+             fp_new += 1
+ 
+     total_new = tp_new + fp_new
+     precision_new = tp_new / total_new if total_new > 0 else 0.0

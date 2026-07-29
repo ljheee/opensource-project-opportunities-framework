@@ -1,0 +1,110 @@
+# Review package: 0abc4ea..HEAD
+
+## Commits
+c83cac0 feat: fetch and sanitize repo README for analysis input
+
+## Files changed
+ framework/stages/analyze.py | 39 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+## Diff
+diff --git a/framework/stages/analyze.py b/framework/stages/analyze.py
+index b380fa1..d8d9b53 100644
+--- a/framework/stages/analyze.py
++++ b/framework/stages/analyze.py
+@@ -4,35 +4,72 @@ Stage 4: Deep Analysis of AI Projects
+ Analyzes scheduled/early-burst projects and identifies extension opportunities.
+ """
+ import os
+ import sys
+ import json
+ import argparse
+ import re
+ import shlex
+ import shutil
+ import subprocess
++import requests
+ from datetime import datetime, timezone
+ from typing import List, Dict, Optional, Tuple
+ 
+ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+ 
+ from framework.core.config_loader import ConfigLoader
+ from framework.core.db import Database
+ from framework.core.scheduler import Scheduler
+ 
+ 
+ VALID_OPPORTUNITY_TYPES = {'product', 'tech', 'market', 'integration', 'business_model'}
+ VALID_IMPACT_LEVELS = {'high', 'medium', 'low'}
+ VALID_DIFFICULTY_LEVELS = {'high', 'medium', 'low'}
+ VALID_TIME_HORIZONS = {'short', 'medium', 'long'}
+ 
++_GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
++_README_HEADERS = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
++if _GITHUB_TOKEN:
++    _README_HEADERS['Authorization'] = f'Bearer {_GITHUB_TOKEN}'
++
++_README_MAX_CHARS = 10000
++_DATA_URI_RE = re.compile(r'!\[[^\]]*\]\(\s*data:[^)]*\)', re.IGNORECASE)
++_IMG_TAG_RE = re.compile(r'<(img|picture|source)[^>]*>.*?</\1>|<(img|source)[^>]*/?>', re.IGNORECASE | re.DOTALL)
++_BADGE_RE = re.compile(r'\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)')
++
++
++def _sanitize_readme(text: str) -> str:
++    """Strip base64 data URIs, img/picture tags, and badge links before truncation."""
++    text = _DATA_URI_RE.sub('', text)
++    text = _IMG_TAG_RE.sub('', text)
++    text = _BADGE_RE.sub('', text)
++    return text[:_README_MAX_CHARS]
++
++
++def _fetch_readme(project_id: str) -> str:
++    """Fetch and sanitize a repo's README. Returns '' on any failure."""
++    try:
++        r = requests.get(
++            f"https://api.github.com/repos/{project_id}/readme",
++            headers=_README_HEADERS, timeout=30
++        )
++        if r.status_code != 200:
++            print(f"  README fetch failed for {project_id}: HTTP {r.status_code}")
++            return ''
++        import base64
++        raw = base64.b64decode(r.json().get('content') or '')
++        return _sanitize_readme(raw.decode('utf-8', errors='replace'))
++    except Exception as e:
++        print(f"  README fetch error for {project_id}: {e}")
++        return ''
++
+ 
+ def _is_whole_word(text: str, pattern: str) -> bool:
+     """Check if pattern appears as a whole word in text."""
+     if not text or not pattern:
+         return False
+     for match in re.finditer(re.escape(pattern), text, re.IGNORECASE):
+         start, end = match.span()
+         left_ok = start == 0 or not text[start - 1].isalnum()
+         right_ok = end == len(text) or not text[end].isalnum()
+         if left_ok and right_ok:
+@@ -190,20 +227,22 @@ def get_project_data(db: Database, project_id: str, conn=None) -> Optional[Dict]
+ 
+         # Get peer projects for competitive context
+         proj_dict['peers'] = db.get_peer_projects(
+             project_id,
+             proj_dict.get('tech_layer'),
+             proj_dict.get('application'),
+             limit=5,
+             conn=conn
+         )
+ 
++        proj_dict['readme'] = _fetch_readme(project_id)
++
+         # Calculate peer percentile
+         proj_dict['peer_percentile'] = _calculate_peer_percentile(
+             proj_dict.get('stars', 0) or 0,
+             proj_dict.get('peers', [])
+         )
+ 
+         # Detect inflection point from star history
+         proj_dict['inflection'] = _detect_inflection(
+             proj_dict.get('star_history', [])
+         )

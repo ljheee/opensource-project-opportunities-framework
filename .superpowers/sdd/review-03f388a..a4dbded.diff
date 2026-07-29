@@ -1,0 +1,142 @@
+# Review package: 03f388a..HEAD
+
+## Commits
+a4dbded feat: add discovery/backfill config keys, renormalize scoring weights (buzz out)
+
+## Files changed
+ config.yaml                     | 14 ++++++++++----
+ framework/core/config_loader.py | 21 +++++++++++++++++++++
+ 2 files changed, 31 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/config.yaml b/config.yaml
+index f695f72..bb8ab35 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -34,51 +34,54 @@ sources:
+   github:
+     topics:
+       - "artificial-intelligence"
+       - "machine-learning"
+       - "deep-learning"
+       - "llm"
+       - "generative-ai"
+       - "ai-agents"
+     languages: ["Python", "TypeScript", "Rust", "Go"]
+     star_range: [50, 50000]
++    created_within_days: 730
++    backfill_max_pages: 30
++    backfill_max_per_day: 50
+ 
+   trending:
+     languages: ["python", "typescript", "rust", "go"]
+     periods: ["daily", "weekly"]
+ 
+   ecosystems:
+     - "huggingface"
+     - "openai"
+     - "langchain-ai"
+     - "pytorch"
+ 
+ early_burst:
+   enabled: true
+   min_score: 0.65
+   metrics:
+     star_velocity:
+-      weight: 0.35
++      weight: 0.45
+       thresholds:
+         weekly_growth_rate: 0.15
+         daily_absolute: 10
+     activity_index:
+-      weight: 0.25
++      weight: 0.35
+       thresholds:
+         commit_frequency: 3
+         pr_merge_rate: 0.3
+     community_buzz:
+-      weight: 0.25
++      weight: 0.0
+       thresholds:
+         default_score: 0.3
+     novelty_signal:
+-      weight: 0.15
++      weight: 0.20
+       thresholds:
+         first_commit_within_months: 6
+         unique_contributors_weekly: 2
+ 
+ filters:
+   required:
+     has_readme: true
+     has_code: true
+   skip_patterns:
+     - "awesome"
+@@ -133,18 +136,21 @@ filters:
+       - "sdk"
+       - "library"
+       - "framework"
+ 
+ scheduling:
+   bulk:
+     batch_size: 20
+     max_per_day: 100
+   incremental:
+     max_per_day: 15
++    star_change_threshold: 0.05
++    recent_commit_days: 3
++    min_reanalyze_days: 7
+ 
+ resilience:
+   github_api:
+     max_retries: 3
+     retry_delay_seconds: 60
+   llm_analysis:
+     max_retries: 2
+     timeout_seconds: 300
+diff --git a/framework/core/config_loader.py b/framework/core/config_loader.py
+index 6d83ffb..2684818 100644
+--- a/framework/core/config_loader.py
++++ b/framework/core/config_loader.py
+@@ -97,20 +97,41 @@ class ConfigLoader:
+             return (50, 50000)
+         try:
+             min_val = int(raw[0])
+             max_val = int(raw[1])
+         except (ValueError, TypeError):
+             return (50, 50000)
+         if min_val < 0 or max_val < 0 or min_val > max_val:
+             return (50, 50000)
+         return (min_val, max_val)
+ 
++    def get_created_within_days(self) -> int:
++        raw = ((self.load().get('sources') or {}).get('github') or {}).get('created_within_days', 730)
++        try:
++            val = int(raw)
++        except (ValueError, TypeError):
++            return 730
++        return val if val > 0 else 730
++
++    def get_backfill_config(self) -> Dict:
++        gh = ((self.load().get('sources') or {}).get('github') or {})
++        def _pos_int(key, default):
++            try:
++                val = int(gh.get(key, default))
++            except (ValueError, TypeError):
++                return default
++            return val if val > 0 else default
++        return {
++            'max_pages': _pos_int('backfill_max_pages', 30),
++            'max_per_day': _pos_int('backfill_max_per_day', 50),
++        }
++
+     def get_ecosystems(self) -> List[str]:
+         ecosystems = (self.load().get('sources') or {}).get('ecosystems', [])
+         return ecosystems if isinstance(ecosystems, list) else []
+ 
+     def get_filters(self) -> Dict:
+         val = self.load().get('filters')
+         return val if isinstance(val, dict) else {}
+ 
+     def get_scheduling_config(self) -> Dict:
+         val = self.load().get('scheduling')

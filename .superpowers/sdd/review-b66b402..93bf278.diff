@@ -1,0 +1,222 @@
+# Review package: b66b402..HEAD
+
+## Commits
+93bf278 docs: amend FN baseline rule, note incremental trigger discovery-blindness
+20eb97f fix: FN baseline uses sample at/before prediction date, freeze FN threshold, trending-scoped recall
+
+## Files changed
+ CLAUDE.md                                          |  2 +-
+ .../plans/2026-07-28-discovery-analysis-fixes.md   |  5 +++--
+ .../2026-07-28-discovery-analysis-fixes-design.md  |  2 +-
+ framework/stages/report.py                         |  9 +++++++--
+ framework/stages/validate.py                       | 22 +++++++++++++++-------
+ 5 files changed, 27 insertions(+), 13 deletions(-)
+
+## Diff
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 3ad4e9f..5b9fcad 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -82,21 +82,21 @@ init_db.py  ->  discover.py  ->  filter.py  ->  schedule.py  ->  analyze.py  ->
+                                                validate.py / reweight.py (closed loop)
+ ```
+ 
+ 1. **init_db.py**: Creates and migrates SQLite tables, and runs crash recovery (`repair_analyzing_status`, `repair_orphan_records`).
+ 2. **discover.py**: Fetches repositories from three sources:
+    - GitHub topic search (`topic:X language:Y stars:min..max`).
+    - Ecosystem organization repos (`/orgs/{org}/repos`).
+    - GitHub Trending HTML parsing.
+    It upserts projects, samples star counts, and computes early-burst signals.
+ 3. **filter.py**: Heuristic semantic filter that classifies `discovered` projects into `tech_layer`/`application` and marks them as `scheduled` or `filtered_skip`.
+-4. **schedule.py**: Creates analysis tasks of type `bulk` or `incremental`, prioritizing by early-burst score.
++4. **schedule.py**: Creates analysis tasks of type `bulk` or `incremental`, prioritizing by early-burst score. Incremental change triggers only see projects still surfaced by discovery — projects that drop out of all discovery sources stop accumulating fresh stars/`last_commit_at` and will not be re-analyzed (known limitation, follow-up).
+ 5. **analyze.py**: Picks pending tasks, optionally calls an LLM CLI tool via `framework/prompts/ai_analyze.md`, and stores `analyses` and `opportunities`. Falls back to a heuristic analyzer when LLM is unavailable.
+ 6. **report.py**: Generates a daily Markdown report in `data/reports/YYYY-MM-DD.md` with global stats, tech-stack distribution, top opportunities, and early-burst project listings.
+ 
+ **validate.py** and **reweight.py** form a closed-loop improvement path:
+ 
+ - `validate.py` records predictions when projects first become early-burst, then after `min_days` compares predicted vs. actual star growth to label outcomes `true_positive` or `false_positive`.
+ - `reweight.py` analyzes these outcomes and proposes/adjusts the weights and `min_score` in `config.yaml`.
+ 
+ ### Data Model
+ 
+diff --git a/docs/superpowers/plans/2026-07-28-discovery-analysis-fixes.md b/docs/superpowers/plans/2026-07-28-discovery-analysis-fixes.md
+index b004e8a..d248857 100644
+--- a/docs/superpowers/plans/2026-07-28-discovery-analysis-fixes.md
++++ b/docs/superpowers/plans/2026-07-28-discovery-analysis-fixes.md
+@@ -800,22 +800,23 @@ def _fn_threshold() -> float:
+               AND julianday('now') - julianday(p.first_seen_at) >= ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM prediction_outcomes po WHERE po.project_id = p.id
+               )
+         ''', (min_days_for_fn,))
+ 
+         fn_recorded = 0
+         for row in fn_cur.fetchall():
+             baseline = conn.execute('''
+                 SELECT stars FROM star_history
+-                WHERE project_id = ? ORDER BY sampled_at ASC LIMIT 1
+-            ''', (row['project_id'],)).fetchone()
++                WHERE project_id = ? AND sampled_at <= date(?)
++                ORDER BY sampled_at DESC LIMIT 1
++            ''', (row['project_id'], row['first_seen_at'])).fetchone()
+             baseline_stars = baseline['stars'] if baseline else row['stars']
+             # 无星史样本时基线是当前 stars，checked_at 记首次发现日（spec §2.4-2）
+             if baseline:
+                 checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+             else:
+                 checked_at = str(row['first_seen_at'])[:10]
+             conn.execute('''
+                 INSERT INTO prediction_outcomes
+                 (project_id, predicted_at, stars_at_prediction,
+                  overall_score_at_prediction,
+diff --git a/docs/superpowers/specs/2026-07-28-discovery-analysis-fixes-design.md b/docs/superpowers/specs/2026-07-28-discovery-analysis-fixes-design.md
+index ade1150..3ca5ba5 100644
+--- a/docs/superpowers/specs/2026-07-28-discovery-analysis-fixes-design.md
++++ b/docs/superpowers/specs/2026-07-28-discovery-analysis-fixes-design.md
+@@ -90,21 +90,21 @@ Review 发现当前实现存在两类核心缺陷：
+ - `fetch_outcomes` 的 SQL 可保留 buzz 列（无害），`compute_component_correlation`、`propose_new_weights` 对 3 组件天然兼容
+ - `fetch_outcomes` 现有 `WHERE outcome IN ('true_positive','false_positive')` 天然排除 false_negative/true_negative 行，无需为 FN 改动
+ 
+ ### 2.4 召回率回溯
+ 
+ 现状：`validate.py` 只记录被判为 early-burst 的项目（validate.py:45），漏检永远不进统计，闭环只能优化精确率。
+ 
+ **完整算法**（review 指出原表述不可实现，本节为实现级定义）：
+ 
+ 1. **候选**：`source='trending'`、最新信号 `is_early_burst=0`、无 prediction_outcomes 行、距首次发现 ≥ `min_days` 的项目
+-2. **记录**：写入 prediction_outcomes 行，`overall_score_at_prediction` 写实际 score（**必然 < min_score**，以此与 TP 候选行区分，免 schema 变更）；`stars_at_prediction` 取 star_history 最早可用样本（无样本则取 projects.stars 当前值并记 checked_at 为首次发现日）；`growth_rate_predicted` 写固定阈值
++2. **记录**：写入 prediction_outcomes 行，`overall_score_at_prediction` 写实际 score（**必然 < min_score**，以此与 TP 候选行区分，免 schema 变更）；`stars_at_prediction` 取 first_seen_at 当日或之前最近的 star_history 样本（原因：回溯合成的历史可能远早于 first_seen，用最早样本会把预测前增长计入预测后增速；无样本则取 projects.stars 当前值并记 checked_at 为首次发现日）；`growth_rate_predicted` 写固定阈值
+ 3. **FN 判定阈值**：固定值 = `min_score × 8 × 0.5`（与 TP 判定公式同源，当前 = 2.6 stars/day）。冷启动不依赖任何 TP 数据
+ 4. **check 分支**：`check_pending_outcomes` 按 `overall_score_at_prediction >= min_score` 区分方向——
+    - TP 候选：现有逻辑不变（actual ≥ predicted×0.5 → true_positive，否则 false_positive）
+    - FN 候选：actual_growth ≥ 固定阈值 → `false_negative`（我们漏了），否则 `true_negative`
+ 5. **互斥**：`record_new_predictions` 先记 TP 候选再处理 FN 候选，两者都受 `NOT EXISTS prediction_outcomes` 去重；项目一旦有任何 prediction 行，不再成为另一方向的候选
+ 6. **已知限制（接受）**：FN 候选项目后来冲过阈值成为真爆发，也永远拿不到正向预测记录（NOT EXISTS 全局去重所致）
+ 7. **展示**：`validate.py print_metrics` 和 `report.py` Validation Metrics 区增加 FN/TN 计数与 recall = TP/(TP+FN)
+ 
+ ### 2.5 速率限额预算（明账）
+ 
+diff --git a/framework/stages/report.py b/framework/stages/report.py
+index a488f15..13e01cf 100644
+--- a/framework/stages/report.py
++++ b/framework/stages/report.py
+@@ -182,22 +182,27 @@ class ReportGenerator:
+                             SELECT AVG(growth_rate_predicted) FROM prediction_outcomes
+                             WHERE outcome = 'false_positive'
+                         ''').fetchone()[0] or 0)
+                     except (ValueError, TypeError):
+                         avg_pred_fp = 0.0
+                     lines.append(f"- **Predictions evaluated:** {total_evaluated} (TP: {tp_count}, FP: {fp_count})")
+                     lines.append(f"- **Precision (7d+ horizon):** {precision:.1%}")
+                     lines.append(f"- **Avg actual growth — TP:** {avg_tp:.1f} stars/day, FP: {avg_fp:.1f} stars/day")
+                     lines.append(f"- **Avg predicted growth — TP:** {avg_pred_tp:.1f} stars/day, FP: {avg_pred_fp:.1f} stars/day")
+                 lines.append(f"- **Missed bursts (FN):** {fn_count} | **Correctly passed (TN):** {tn_count}")
+-                if tp_count + fn_count > 0:
+-                    recall = tp_count / (tp_count + fn_count)
++                tp_trending = int(conn.execute('''
++                    SELECT COUNT(*) FROM prediction_outcomes po
++                    JOIN projects p ON po.project_id = p.id
++                    WHERE po.outcome = 'true_positive' AND p.source = 'trending'
++                ''').fetchone()[0] or 0)
++                if tp_trending + fn_count > 0:
++                    recall = tp_trending / (tp_trending + fn_count)
+                     lines.append(f"- **Recall (trending-source):** {recall:.1%}")
+ 
+                 # Score bucket calibration table
+                 buckets = conn.execute('''
+                     SELECT
+                         CASE
+                             WHEN overall_score_at_prediction >= 0.8 THEN '0.8+'
+                             WHEN overall_score_at_prediction >= 0.7 THEN '0.7-0.8'
+                             WHEN overall_score_at_prediction >= 0.65 THEN '0.65-0.7'
+                             ELSE '<0.65'
+diff --git a/framework/stages/validate.py b/framework/stages/validate.py
+index c8205d4..9104b9a 100644
+--- a/framework/stages/validate.py
++++ b/framework/stages/validate.py
+@@ -97,22 +97,23 @@ def record_new_predictions(db: Database, min_days_for_fn: int = 7):
+               AND julianday('now') - julianday(p.first_seen_at) >= ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM prediction_outcomes po WHERE po.project_id = p.id
+               )
+         ''', (min_days_for_fn,))
+ 
+         fn_recorded = 0
+         for row in fn_cur.fetchall():
+             baseline = conn.execute('''
+                 SELECT stars FROM star_history
+-                WHERE project_id = ? ORDER BY sampled_at ASC LIMIT 1
+-            ''', (row['project_id'],)).fetchone()
++                WHERE project_id = ? AND sampled_at <= date(?)
++                ORDER BY sampled_at DESC LIMIT 1
++            ''', (row['project_id'], row['first_seen_at'])).fetchone()
+             baseline_stars = baseline['stars'] if baseline else row['stars']
+             # 无星史样本时基线是当前 stars，checked_at 记首次发现日（spec §2.4-2）
+             if baseline:
+                 checked_at = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+             else:
+                 checked_at = str(row['first_seen_at'])[:10]
+             conn.execute('''
+                 INSERT INTO prediction_outcomes
+                 (project_id, predicted_at, stars_at_prediction,
+                  overall_score_at_prediction,
+@@ -187,22 +188,23 @@ def check_pending_outcomes(db: Database, min_days: int = 7):
+ 
+             if is_tp_candidate:
+                 # 原有 TP 候选逻辑（保持不变）
+                 if stars_now <= stars_then:
+                     outcome = 'false_positive'
+                 elif actual_growth >= predicted_growth * 0.5:
+                     outcome = 'true_positive'
+                 else:
+                     outcome = 'false_positive'
+             else:
+-                # FN 候选：实际增速超过固定阈值 = 我们漏掉的爆发
+-                if actual_growth >= _fn_threshold():
++                # FN 候选：实际增速超过记录时固化的阈值（growth_rate_predicted）
++                # = 我们漏掉的爆发；不读 live min_score，避免 reweight 后阈值漂移。
++                if actual_growth >= predicted_growth:
+                     outcome = 'false_negative'
+                 else:
+                     outcome = 'true_negative'
+ 
+             conn.execute('''
+                 UPDATE prediction_outcomes
+                 SET checked_at = date('now'),
+                     stars_now = ?,
+                     growth_rate_actual = ?,
+                     growth_rate_predicted = ?,
+@@ -277,23 +279,29 @@ def print_metrics(db: Database):
+             try:
+                 avg_fp = float(conn.execute('''
+                     SELECT AVG(growth_rate_actual) FROM prediction_outcomes
+                     WHERE outcome = 'false_positive'
+                 ''').fetchone()[0] or 0)
+             except (ValueError, TypeError):
+                 avg_fp = 0.0
+ 
+             print(f"Avg actual growth — TP: {avg_tp:.1f} stars/day, FP: {avg_fp:.1f} stars/day")
+ 
+-        print(f"Recall candidates — FN (missed bursts): {fn}, TN: {tn}")
+-        if tp + fn > 0:
+-            print(f"Recall (trending-source): {tp / (tp + fn):.2%}")
++        if fn + tn > 0 or tp > 0:
++            tp_trending = int(conn.execute('''
++                SELECT COUNT(*) FROM prediction_outcomes po
++                JOIN projects p ON po.project_id = p.id
++                WHERE po.outcome = 'true_positive' AND p.source = 'trending'
++            ''').fetchone()[0] or 0)
++            print(f"Recall candidates — FN (missed bursts): {fn}, TN: {tn}")
++            if tp_trending + fn > 0:
++                print(f"Recall (trending-source): {tp_trending / (tp_trending + fn):.2%}")
+ 
+         # Score bucket calibration
+         print("\n--- Score Bucket Calibration ---")
+         buckets = conn.execute('''
+             SELECT
+                 CASE
+                     WHEN overall_score_at_prediction >= 0.8 THEN '0.8+'
+                     WHEN overall_score_at_prediction >= 0.7 THEN '0.7-0.8'
+                     WHEN overall_score_at_prediction >= 0.65 THEN '0.65-0.7'
+                     ELSE '<0.65'

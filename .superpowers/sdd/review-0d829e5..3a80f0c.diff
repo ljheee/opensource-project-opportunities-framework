@@ -1,0 +1,187 @@
+# Review package: 0d829e5..HEAD
+
+## Commits
+3a80f0c fix: backfill guard uses history depth so 1-sample legacy projects backfill
+52a1d9f feat: wire star-history backfill into ingest with daily budget and synthetic flag
+
+## Files changed
+ framework/stages/discover.py | 38 +++++++++++++++++++++++++++++++-------
+ 1 file changed, 31 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/framework/stages/discover.py b/framework/stages/discover.py
+index 5499439..462ca38 100644
+--- a/framework/stages/discover.py
++++ b/framework/stages/discover.py
+@@ -52,20 +52,21 @@ def _to_bool(val) -> bool:
+ class DiscoverStage:
+     """Multi-source project discovery stage."""
+ 
+     def __init__(self, config: ConfigLoader, db: Database):
+         self.config = config
+         self.db = db
+         self.scoring = ScoringEngine(config.get_early_burst_config())
+         self.resilience = config.get_resilience_config()
+         self.star_min, self.star_max = config.get_star_range()
+         self.created_within_days = config.get_created_within_days()
++        self._backfills_done = 0
+ 
+     def _github_request(self, url: str, params: Optional[Dict] = None,
+                        is_search: bool = False, headers: Optional[Dict] = None) -> Dict:
+         """Make GitHub API request with rate limit handling.
+ 
+         headers: optional override/merge into the default HEADERS
+         (e.g. stargazers endpoints need Accept: application/vnd.github.star+json).
+         """
+         global _last_request_time
+ 
+@@ -360,31 +361,37 @@ class DiscoverStage:
+                 if page_earliest is None or d < page_earliest:
+                     page_earliest = d
+             # Stop when the whole page is older than the 35-day window
+             if page_earliest is not None and page_earliest < cutoff_date:
+                 break
+         return timestamps
+ 
+     def _backfill_star_history(self, project_id: str, stars: int, conn=None) -> int:
+         """Rebuild daily star history from stargazer timestamps (first-seen projects).
+ 
+-        Returns number of synthetic rows written. Skips entirely if the project
+-        already has star_history rows. Synthetic rows use 'YYYY-MM-DD' dates to
++        Returns number of synthetic rows written. Skips when the project already
++        has >= 7 star_history samples (a full velocity window of real depth, or a
++        previous backfill). Skips also when rows span >= 3 distinct dates, which
++        marks a completed backfill even when it produced fewer than 7 rows (stars
++        concentrated on few days); legacy projects carry a single early sample on
++        one date, so they still backfill. Synthetic rows use 'YYYY-MM-DD' dates to
+         match db.sample_star_count's date(?) format and UNIQUE(project_id, sampled_at).
+         """
+         should_close = conn is None
+         conn = conn or self.db.get_conn()
+         try:
+-            existing = conn.execute(
+-                'SELECT 1 FROM star_history WHERE project_id = ? LIMIT 1', (project_id,)
++            row = conn.execute(
++                'SELECT COUNT(*) AS c, COUNT(DISTINCT sampled_at) AS d '
++                'FROM star_history WHERE project_id = ?',
++                (project_id,)
+             ).fetchone()
+-            if existing:
++            if row['c'] >= 7 or row['d'] >= 3:
+                 return 0
+             timestamps = self._fetch_stargazer_timestamps(project_id, stars)
+             if not timestamps:
+                 return 0
+             # Count stars per UTC date; accumulate oldest -> newest
+             per_day: Dict[str, int] = {}
+             for ts in timestamps:
+                 day = ts[:10]
+                 per_day[day] = per_day.get(day, 0) + 1
+             # Total stars covered by fetched timestamps; stars before the oldest
+@@ -401,20 +408,30 @@ class DiscoverStage:
+                 )
+                 written += 1
+             if should_close:
+                 conn.commit()
+             print(f"  Backfilled {written} days of star history for {project_id}")
+             return written
+         finally:
+             if should_close:
+                 conn.close()
+ 
++    def _backfill_within_budget(self, project_id: str, stars: int, conn) -> int:
++        """Backfill one project if the daily budget allows. Returns rows written."""
++        budget = self.config.get_backfill_config()['max_per_day']
++        if self._backfills_done >= budget:
++            return 0
++        written = self._backfill_star_history(project_id, stars, conn=conn)
++        if written > 0:
++            self._backfills_done += 1
++        return written
++
+     def _calculate_and_store_burst_score(self, project_id: str, conn=None):
+         """Calculate early-burst score from sampled data."""
+         should_close = conn is None
+         conn = conn or self.db.get_conn()
+         try:
+             # Get current project info
+             proj = conn.execute(
+                 'SELECT * FROM projects WHERE id = ?', (project_id,)
+             ).fetchone()
+ 
+@@ -518,21 +535,25 @@ class DiscoverStage:
+                 result['activity_index_score'],
+                 result['community_buzz_score'],
+                 result['novelty_score'],
+                 result['overall_score'],
+                 result['is_early_burst'],
+                 json.dumps({
+                     'stars_7d_ago': stars_7d_ago,
+                     'stars_14d_ago': stars_14d_ago,
+                     'stars_21d_ago': stars_21d_ago,
+                     'stars_30d_ago': stars_30d_ago,
+-                    'current_stars': current_stars
++                    'current_stars': current_stars,
++                    'synthetic_history': bool(
++                        history and proj['first_seen_at']
++                        and min(h['sampled_at'] for h in history) < str(proj['first_seen_at'])[:10]
++                    ),
+                 })
+             ))
+             if should_close:
+                 conn.commit()
+ 
+         finally:
+             if should_close:
+                 conn.close()
+ 
+     def discover_topics(self) -> List[Dict]:
+@@ -765,23 +786,25 @@ class DiscoverStage:
+         stored_count = 0
+         conn = self.db.get_conn()
+         try:
+             for item in unique_results:
+                 try:
+                     project_id = self._upsert_project(
+                         item['repo'], item['source'], item['signal'],
+                         conn=conn
+                     )
+                     stored_count += 1
++                    new_stars = (item.get('repo') or {}).get('stargazers_count') or 0
++                    self._backfill_within_budget(project_id, new_stars, conn=conn)
+                     self._sample_star_count(
+                         project_id,
+-                        (item.get('repo') or {}).get('stargazers_count') or 0,
++                        new_stars,
+                         conn=conn
+                     )
+                     self._calculate_and_store_burst_score(project_id, conn=conn)
+                 except Exception as e:
+                     repo_name = (item.get('repo') or {}).get('full_name', 'unknown')
+                     print(f"  Error storing {repo_name}: {e}")
+             conn.commit()
+         finally:
+             conn.close()
+ 
+@@ -795,20 +818,21 @@ class DiscoverStage:
+                 "SELECT id, stars FROM projects WHERE status IN ('scheduled', 'active')"
+             ).fetchall()
+ 
+             sampled = 0
+             for proj in active_projects:
+                 try:
+                     try:
+                         proj_stars = int(proj['stars']) if proj['stars'] is not None else 0
+                     except (ValueError, TypeError):
+                         proj_stars = 0
++                    self._backfill_within_budget(proj['id'], proj_stars, conn=conn)
+                     self._sample_star_count(proj['id'], proj_stars, conn=conn)
+                     self._calculate_and_store_burst_score(proj['id'], conn=conn)
+                     sampled += 1
+                 except Exception as e:
+                     print(f"  Error sampling {proj['id']}: {e}")
+             conn.commit()
+ 
+             print(f"  Sampled {sampled}/{len(active_projects)} existing projects")
+         finally:
+             conn.close()

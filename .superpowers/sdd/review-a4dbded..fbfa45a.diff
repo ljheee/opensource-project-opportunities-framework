@@ -1,0 +1,101 @@
+# Review package: a4dbded..fbfa45a
+
+## Commits
+fbfa45a feat: topics search targets recent repos (created cutoff + sort=updated)
+
+## Files changed
+ framework/stages/discover.py | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+## Diff
+diff --git a/framework/stages/discover.py b/framework/stages/discover.py
+index 763393c..2a57960 100644
+--- a/framework/stages/discover.py
++++ b/framework/stages/discover.py
+@@ -51,24 +51,29 @@ def _to_bool(val) -> bool:
+ 
+ class DiscoverStage:
+     """Multi-source project discovery stage."""
+ 
+     def __init__(self, config: ConfigLoader, db: Database):
+         self.config = config
+         self.db = db
+         self.scoring = ScoringEngine(config.get_early_burst_config())
+         self.resilience = config.get_resilience_config()
+         self.star_min, self.star_max = config.get_star_range()
++        self.created_within_days = config.get_created_within_days()
+ 
+     def _github_request(self, url: str, params: Optional[Dict] = None,
+-                       is_search: bool = False) -> Dict:
+-        """Make GitHub API request with rate limit handling."""
++                       is_search: bool = False, headers: Optional[Dict] = None) -> Dict:
++        """Make GitHub API request with rate limit handling.
++
++        headers: optional override/merge into the default HEADERS
++        (e.g. stargazers endpoints need Accept: application/vnd.github.star+json).
++        """
+         global _last_request_time
+ 
+         # Rate limiting for search API
+         if is_search:
+             elapsed = time.time() - _last_request_time
+             if elapsed < 2:
+                 time.sleep(max(0, 2 - elapsed))
+         else:
+             elapsed = time.time() - _last_request_time
+             if elapsed < 0.5:
+@@ -81,23 +86,24 @@ class DiscoverStage:
+             max_retries = 3
+         try:
+             retry_delay = max(int(github_api_cfg.get('retry_delay_seconds', 60)), 0)
+         except (ValueError, TypeError):
+             retry_delay = 60
+         if max_retries < 1:
+             max_retries = 1
+ 
+         for attempt in range(max_retries):
+             try:
++                req_headers = {**HEADERS, **headers} if headers else HEADERS
+                 response = requests.get(
+                     url,
+-                    headers=HEADERS,
++                    headers=req_headers,
+                     params=params,
+                     timeout=30
+                 )
+                 _last_request_time = time.time()
+ 
+                 # Handle rate limiting
+                 if response.status_code == 403 and 'rate limit' in response.text.lower():
+                     if attempt >= max_retries - 1:
+                         raise GitHubAPIError(f"Rate limited after {attempt + 1} attempts")
+                     try:
+@@ -446,25 +452,26 @@ class DiscoverStage:
+             languages = []
+         languages = [str(l) for l in languages if l]
+ 
+         print(f"Discovering from {len(topics)} topics x {len(languages)} languages...")
+ 
+         for topic in topics:
+             for lang in languages:
+                 # Quote topic/lang if they contain spaces for valid GitHub search syntax
+                 safe_topic = f'"{topic}"' if ' ' in topic else topic
+                 safe_lang = f'"{lang}"' if ' ' in lang else lang
+-                query = f"topic:{safe_topic} language:{safe_lang} stars:{self.star_min}..{self.star_max}"
++                cutoff = (datetime.now(timezone.utc) - timedelta(days=self.created_within_days)).strftime('%Y-%m-%d')
++                query = f"topic:{safe_topic} language:{safe_lang} stars:{self.star_min}..{self.star_max} created:>{cutoff}"
+                 url = "https://api.github.com/search/repositories"
+ 
+                 try:
+-                    data = self._github_request(url, {"q": query, "sort": "stars", "per_page": 30}, is_search=True)
++                    data = self._github_request(url, {"q": query, "sort": "updated", "per_page": 30}, is_search=True)
+ 
+                     if not isinstance(data, dict):
+                         print(f"  Unexpected search response type: {type(data)}")
+                         continue
+ 
+                     items = data.get('items')
+                     if not isinstance(items, list):
+                         print(f"  Unexpected items type: {type(items)}")
+                         continue
+                     for repo in items:

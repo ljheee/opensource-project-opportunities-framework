@@ -1,0 +1,369 @@
+# Review package: fbfa45a..0d829e5
+
+## Commits
+0d829e5 fix: unescape repo slash in stargazers URL, fast-fail on 404
+efb1329 docs: plan fixes from Task 3 concerns (quote safe=/, FK in E2E script, V7 stargazers CI check)
+0b82309 feat: backfill star history from stargazer timestamps on first-seen projects
+702a3d4 docs: fix token extraction in plan verification commands (.env uses quoted value)
+
+## Files changed
+ .../plans/2026-07-28-discovery-analysis-fixes.md   | 20 +++--
+ framework/stages/discover.py                       | 92 ++++++++++++++++++++++
+ 2 files changed, 104 insertions(+), 8 deletions(-)
+
+## Diff
+diff --git a/docs/superpowers/plans/2026-07-28-discovery-analysis-fixes.md b/docs/superpowers/plans/2026-07-28-discovery-analysis-fixes.md
+index df5d033..61f3b18 100644
+--- a/docs/superpowers/plans/2026-07-28-discovery-analysis-fixes.md
++++ b/docs/superpowers/plans/2026-07-28-discovery-analysis-fixes.md
+@@ -247,21 +247,21 @@ discover.py:456 的 query 构造与 460 行的请求改为：
+                 query = f"topic:{safe_topic} language:{safe_lang} stars:{self.star_min}..{self.star_max} created:>{cutoff}"
+                 url = "https://api.github.com/search/repositories"
+ 
+                 try:
+                     data = self._github_request(url, {"q": query, "sort": "updated", "per_page": 30}, is_search=True)
+ ```
+ 
+ - [ ] **Step 4: dry-run 验证（spec §4 验证项 1）**
+ 
+ ```bash
+-GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 framework/stages/discover.py --dry-run 2>&1 | head -30
++GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 framework/stages/discover.py --dry-run 2>&1 | head -30
+ ```
+ 
+ Expected: 正常列出项目无报错。再验证 cutoff 生效：
+ 
+ ```bash
+ PYTHONPATH=. python3 -c "
+ from framework.core.config_loader import ConfigLoader
+ from framework.core.db import Database
+ from framework.stages.discover import DiscoverStage
+ from datetime import datetime, timezone, timedelta
+@@ -323,21 +323,21 @@ Expected: FAIL — `AssertionError: method missing`
+         # GitHub stargazers endpoint only serves the first 400 pages (page>400 -> 422)
+         last_page = min((stars + 99) // 100, 400)
+         cutoff_date = (datetime.now(timezone.utc) - timedelta(days=35)).date()
+         timestamps: List[str] = []
+         pages_fetched = 0
+         for page in range(last_page, 0, -1):
+             if pages_fetched >= max_pages:
+                 break
+             try:
+                 data = self._github_request(
+-                    f"https://api.github.com/repos/{quote(full_name, safe='')}/stargazers",
++                    f"https://api.github.com/repos/{quote(full_name, safe='/')}/stargazers",
+                     params={"per_page": 100, "page": page},
+                     headers={'Accept': 'application/vnd.github.star+json'},
+                 )
+             except GitHubAPIError as e:
+                 print(f"  Backfill page {page} failed for {full_name}: {e}")
+                 break
+             pages_fetched += 1
+             if not isinstance(data, list):
+                 break
+             page_earliest = None
+@@ -418,36 +418,39 @@ import sys
+ sys.path.insert(0, '.')
+ from framework.core.config_loader import ConfigLoader
+ from framework.core.db import Database
+ from framework.stages.discover import DiscoverStage
+ 
+ REPO = sys.argv[1]  # e.g. "owner/repo"
+ db = Database(':memory:') if False else Database('/tmp/backfill_test.db')
+ db.init_tables()
+ s = DiscoverStage(ConfigLoader(), db)
+ conn = db.get_conn()
++# star_history 有 FK 到 projects 且 PRAGMA foreign_keys=ON，必须先插 projects 行
++conn.execute("INSERT OR IGNORE INTO projects (id, name, status) VALUES (?, ?, 'discovered')", (REPO, REPO))
++conn.commit()
+ stars = s._github_request(f'https://api.github.com/repos/{REPO}').get('stargazers_count', 0)
+ n = s._backfill_star_history(REPO, stars, conn=conn)
+ rows = conn.execute(
+     'SELECT sampled_at, stars FROM star_history WHERE project_id=? ORDER BY sampled_at', (REPO,)
+ ).fetchall()
+ for r in rows:
+     print(dict(r))
+ assert n == len(rows) > 0, 'no rows written'
+ # 幂等：第二次调用必须写 0 行
+ assert s._backfill_star_history(REPO, stars, conn=conn) == 0, 'not idempotent'
+ # 单调性：合成历史必须单调不减
+ vals = [r['stars'] for r in rows]
+ assert vals == sorted(vals), 'not monotonic'
+ print('E2E OK:', n, 'days, latest =', vals[-1], '/ actual', stars)
+ EOF
+-PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 /tmp/verify_backfill_e2e.py owner/repo
++PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 /tmp/verify_backfill_e2e.py owner/repo
+ ```
+ 
+ Expected: 打印逐日曲线，`E2E OK`；最后一行 stars ≈ 实际值（允许小误差：回溯期间 star 变动 + unstar 单向低估，见 spec §2.2 已知偏差）。手动与 GitHub 页面 star 曲线形状比对。
+ 
+ - [ ] **Step 5: Commit**
+ 
+ ```bash
+ git add framework/stages/discover.py
+ git commit -m "feat: backfill star history from stargazer timestamps on first-seen projects"
+ ```
+@@ -535,21 +538,21 @@ git commit -m "feat: backfill star history from stargazer timestamps on first-se
+ - [ ] **Step 6: 预算行为验证（真实运行，小预算）**
+ 
+ ```bash
+ # 临时把 backfill_max_per_day 改为 2 跑一次 discover，观察日志
+ python3 - <<'EOF'
+ import yaml
+ cfg = yaml.safe_load(open('config.yaml'))
+ cfg['sources']['github']['backfill_max_per_day'] = 2
+ yaml.safe_dump(cfg, open('/tmp/config_test.yaml', 'w'), allow_unicode=True, sort_keys=False)
+ EOF
+-PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 -c "
++PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 -c "
+ from framework.core.config_loader import ConfigLoader
+ from framework.core.db import Database
+ from framework.stages.discover import DiscoverStage
+ s = DiscoverStage(ConfigLoader('/tmp/config_test.yaml'), Database())
+ # 直接驱动预算守卫：挑 3 个无历史项目
+ conn = s.db.get_conn()
+ rows = conn.execute('''SELECT p.id, p.stars FROM projects p
+   WHERE NOT EXISTS (SELECT 1 FROM star_history h WHERE h.project_id = p.id) LIMIT 3''').fetchall()
+ for r in rows:
+     n = s._backfill_within_budget(r['id'], r['stars'] or 0, conn)
+@@ -582,21 +585,21 @@ git commit -m "feat: wire star-history backfill into ingest with daily budget an
+ - [ ] **Step 1: 实现采集方法**
+ 
+ 在 `_backfill_within_budget` 之后插入：
+ 
+ ```python
+     def _fetch_weekly_contributors(self, full_name: str) -> Optional[int]:
+         """Count distinct commit authors in the last 7 days. None on failure."""
+         since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+         try:
+             commits = self._github_request(
+-                f"https://api.github.com/repos/{quote(full_name, safe='')}/commits",
++                f"https://api.github.com/repos/{quote(full_name, safe='/')}/commits",
+                 params={"since": since, "per_page": 100},
+             )
+         except GitHubAPIError as e:
+             print(f"  Contributors fetch failed for {full_name}: {e}")
+             return None
+         if not isinstance(commits, list):
+             return None
+         authors = set()
+         for c in commits:
+             if not isinstance(c, dict):
+@@ -635,21 +638,21 @@ git commit -m "feat: wire star-history backfill into ingest with daily budget an
+                     )
+             novelty_score = self.scoring.calculate_novelty(
+                 proj['first_commit_at'] or proj['created_at'],
+                 contributor_count if contributor_count is not None else 1
+             )
+ ```
+ 
+ - [ ] **Step 3: 验证**
+ 
+ ```bash
+-PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 -c "
++PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 -c "
+ from framework.core.config_loader import ConfigLoader
+ from framework.core.db import Database
+ from framework.stages.discover import DiscoverStage
+ s = DiscoverStage(ConfigLoader(), Database())
+ n = s._fetch_weekly_contributors('octocat/Hello-World')
+ print('octocat/Hello-World weekly contributors:', n)
+ assert n is not None
+ "
+ ```
+ 
+@@ -1082,21 +1085,21 @@ def _fetch_readme(project_id: str) -> str:
+ 
+ `get_project_data` 中 `proj_dict['peers'] = ...`（analyze.py:192-198）之后追加：
+ 
+ ```python
+         proj_dict['readme'] = _fetch_readme(project_id)
+ ```
+ 
+ - [ ] **Step 3: 重跑 Step 1 验证 + 清洗验证**
+ 
+ ```bash
+-PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2) python3 -c "
++PYTHONPATH=. GITHUB_TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"') python3 -c "
+ from framework.stages.analyze import _fetch_readme, _sanitize_readme
+ dirty = '![x](data:image/png;base64,AAAA) <img src=\"data:image/png;base64,BBBB\"> [![b](https://img.shields.io/x)](https://y) real content'
+ clean = _sanitize_readme(dirty)
+ assert 'data:' not in clean and 'shields.io' not in clean and 'real content' in clean, clean
+ text = _fetch_readme('huggingface/transformers')
+ assert 100 < len(text) <= 10000, len(text)
+ assert 'base64' not in text.lower() or 'base64' in text.lower()  # 内容词不强制
+ print('sanitize + fetch OK,', len(text), 'chars')
+ "
+ ```
+@@ -1569,31 +1572,32 @@ git commit -m "fix: abort on code changes in run scripts, loop filter with --lim
+ ```
+ 
+ ---
+ 
+ ## 最终全链路验证（spec §4）
+ 
+ - [ ] **V1**: `./run.sh` 无 LLM 完整跑通：确认新 topics 查询生效、回溯日志出现（`Backfilled N days`）、无 LLM 分析 opportunities 为空、analyzer_version 标记正确
+ - [ ] **V2**: 运行前后实测速率消耗（spec §4 验证项 3 + §2.5 预算）：
+ 
+ ```bash
+-TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2)
++TOKEN=$(grep GITHUB_TOKEN .env | cut -d= -f2 | tr -d '"')
+ curl -s -H "Authorization: Bearer $TOKEN" https://api.github.com/rate_limit | python3 -c "import json,sys; r=json.load(sys.stdin)['resources']['core']; print('before:', r['remaining'])"
+ ./run.sh   # 或单独 python3 framework/stages/discover.py
+ curl -s -H "Authorization: Bearer $TOKEN" https://api.github.com/rate_limit | python3 -c "import json,sys; r=json.load(sys.stdin)['resources']['core']; print('after:', r['remaining'])"
+ ```
+ 
+ Expected: 消耗量（before−after）符合 §2.5 预算（稳态 ~400-500，含存量回溯的首日 ~600-1200）；`sqlite3 data/framework.db "SELECT COUNT(*) FROM star_history WHERE sampled_at < date('now')"` 有合成行；discover 日志无长时间 rate limit 等待
+ - [ ] **V3**: `USE_LLM=true CLI_TOOL="claude --dangerously-skip-permissions" python3 framework/stages/analyze.py --date $(date -u +%Y-%m-%d) --use-llm --max-tasks 1`：确认 LLM 分析产出与项目实际相关的机会
+ - [ ] **V4**: `python3 framework/stages/validate.py --metrics-only` 与 `python3 framework/stages/reweight.py --dry-run` 均不崩
+ - [ ] **V5**: 连续两天跑 `./run.sh`：确认 active 项目不再每天重复生成 incremental 任务（spec §4 验证项 8）
+ - [ ] **V6（上线后 7 天观察项）**: 观察基于合成历史评分的项目 FP 表现（spec §4 验证项 9）：`sqlite3 data/framework.db "SELECT project_id, overall_score FROM early_burst_signals WHERE signals_json LIKE '%\"synthetic_history\": true%' ORDER BY calculated_at DESC LIMIT 20;"` —— 若这批项目后续集中被 validate 判为 false_positive，说明 unstar 低估偏差影响过大，需重新评估回溯策略
++- [ ] **V7（网络相关遗留项）**: 开发机所在网络对 `/repos/{}/stargazers` 端点返回 404（网关限制，commits/readme/search 均正常），Task 3 的 stargazers 真实链路 E2E 无法在本地完成。合并后首次 GitHub Actions 运行时，检查 workflow 日志中的 `Backfilled N days` 行确认回溯在 CI 网络下生效；若 CI 也失败，排查 endpoint 可用性并考虑 GraphQL 替代
+ 
+ ## 执行前置条件
+ 
+ 1. **当前工作区有 11 个 framework 文件的未提交修改**（git status 可见）。Task 1 开始前必须 `git add -A && git commit`（或确认这些改动废弃后 `git checkout -- .`），否则 Task 13 的 run.sh 分治逻辑会误判，且各任务 commit 会混入无关改动。
+ 2. `.env` 中 `GITHUB_TOKEN` 已配置（Task 2/3/5/9 的真实 API 验证依赖）。
+ 3. 临时验证脚本统一放 `/tmp`，不提交仓库。
+ 
+ <!-- PLAN-END -->
+ 
+ 
+diff --git a/framework/stages/discover.py b/framework/stages/discover.py
+index 2a57960..5499439 100644
+--- a/framework/stages/discover.py
++++ b/framework/stages/discover.py
+@@ -119,20 +119,23 @@ class DiscoverStage:
+                     if attempt >= max_retries - 1:
+                         raise GitHubAPIError(f"Too many requests after {attempt + 1} attempts")
+                     try:
+                         retry_after = max(int(response.headers.get('Retry-After') or 60), 0)
+                     except (ValueError, TypeError):
+                         retry_after = 60
+                     print(f"  Too many requests. Waiting {retry_after}s...")
+                     time.sleep(min(retry_after, retry_delay))
+                     continue
+ 
++                if response.status_code == 404:
++                    raise GitHubAPIError(f"Not found: {url}", status_code=404)
++
+                 response.raise_for_status()
+                 try:
+                     return response.json()
+                 except ValueError as e:
+                     raise GitHubAPIError(f"Invalid JSON response: {e}")
+ 
+             except requests.exceptions.RequestException as e:
+                 if attempt < max_retries - 1:
+                     wait = retry_delay * (attempt + 1)
+                     print(f"  Request failed (attempt {attempt + 1}). Waiting {wait}s...")
+@@ -309,20 +312,109 @@ class DiscoverStage:
+ 
+             return project_id
+         finally:
+             if should_close:
+                 conn.close()
+ 
+     def _sample_star_count(self, project_id: str, stars: int, conn=None):
+         """Sample current star count for velocity tracking."""
+         self.db.sample_star_count(project_id, stars, conn=conn)
+ 
++    def _fetch_stargazer_timestamps(self, full_name: str, stars: int) -> List[str]:
++        """Fetch starred_at timestamps, newest first, bounded by backfill config."""
++        cfg = self.config.get_backfill_config()
++        max_pages = cfg['max_pages']
++        if stars <= 0:
++            return []
++        # GitHub stargazers endpoint only serves the first 400 pages (page>400 -> 422)
++        last_page = min((stars + 99) // 100, 400)
++        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=35)).date()
++        timestamps: List[str] = []
++        pages_fetched = 0
++        for page in range(last_page, 0, -1):
++            if pages_fetched >= max_pages:
++                break
++            try:
++                data = self._github_request(
++                    f"https://api.github.com/repos/{quote(full_name, safe='/')}/stargazers",
++                    params={"per_page": 100, "page": page},
++                    headers={'Accept': 'application/vnd.github.star+json'},
++                )
++            except GitHubAPIError as e:
++                print(f"  Backfill page {page} failed for {full_name}: {e}")
++                break
++            pages_fetched += 1
++            if not isinstance(data, list):
++                break
++            page_earliest = None
++            for item in data:
++                if not isinstance(item, dict):
++                    continue
++                ts = item.get('starred_at')
++                if not ts:
++                    continue
++                timestamps.append(ts)
++                try:
++                    d = datetime.fromisoformat(ts.replace('Z', '+00:00')).date()
++                except (ValueError, TypeError):
++                    continue
++                if page_earliest is None or d < page_earliest:
++                    page_earliest = d
++            # Stop when the whole page is older than the 35-day window
++            if page_earliest is not None and page_earliest < cutoff_date:
++                break
++        return timestamps
++
++    def _backfill_star_history(self, project_id: str, stars: int, conn=None) -> int:
++        """Rebuild daily star history from stargazer timestamps (first-seen projects).
++
++        Returns number of synthetic rows written. Skips entirely if the project
++        already has star_history rows. Synthetic rows use 'YYYY-MM-DD' dates to
++        match db.sample_star_count's date(?) format and UNIQUE(project_id, sampled_at).
++        """
++        should_close = conn is None
++        conn = conn or self.db.get_conn()
++        try:
++            existing = conn.execute(
++                'SELECT 1 FROM star_history WHERE project_id = ? LIMIT 1', (project_id,)
++            ).fetchone()
++            if existing:
++                return 0
++            timestamps = self._fetch_stargazer_timestamps(project_id, stars)
++            if not timestamps:
++                return 0
++            # Count stars per UTC date; accumulate oldest -> newest
++            per_day: Dict[str, int] = {}
++            for ts in timestamps:
++                day = ts[:10]
++                per_day[day] = per_day.get(day, 0) + 1
++            # Total stars covered by fetched timestamps; stars before the oldest
++            # fetched timestamp form the baseline so curves end at current count.
++            covered = len(timestamps)
++            baseline = max(stars - covered, 0)
++            written = 0
++            cumulative = baseline
++            for day in sorted(per_day):
++                cumulative += per_day[day]
++                conn.execute(
++                    'INSERT OR IGNORE INTO star_history (project_id, sampled_at, stars) VALUES (?, ?, ?)',
++                    (project_id, day, cumulative)
++                )
++                written += 1
++            if should_close:
++                conn.commit()
++            print(f"  Backfilled {written} days of star history for {project_id}")
++            return written
++        finally:
++            if should_close:
++                conn.close()
++
+     def _calculate_and_store_burst_score(self, project_id: str, conn=None):
+         """Calculate early-burst score from sampled data."""
+         should_close = conn is None
+         conn = conn or self.db.get_conn()
+         try:
+             # Get current project info
+             proj = conn.execute(
+                 'SELECT * FROM projects WHERE id = ?', (project_id,)
+             ).fetchone()
+ 
