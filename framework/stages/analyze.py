@@ -64,6 +64,31 @@ def _fetch_readme(project_id: str) -> str:
         return ''
 
 
+_CORE_EXCERPT_MAX = 5000
+
+
+def _fetch_core_excerpts(project_id: str, core_paths: List) -> List[Dict]:
+    """Fetch up to 3 core file excerpts via raw.githubusercontent.com (no API quota)."""
+    excerpts = []
+    for path in (core_paths or [])[:3]:
+        if not isinstance(path, str) or not path:
+            continue
+        try:
+            r = requests.get(
+                f"https://raw.githubusercontent.com/{project_id}/HEAD/{path}",
+                headers={'User-Agent': 'Mozilla/5.0'}, timeout=15
+            )
+            if r.status_code != 200:
+                continue
+            text = r.text
+            if '\x00' in text[:8192]:
+                continue  # binary
+            excerpts.append({'path': path, 'content': text[:_CORE_EXCERPT_MAX]})
+        except requests.exceptions.RequestException:
+            continue
+    return excerpts
+
+
 def _is_whole_word(text: str, pattern: str) -> bool:
     """Check if pattern appears as a whole word in text."""
     if not text or not pattern:
@@ -235,6 +260,18 @@ def get_project_data(db: Database, project_id: str, conn=None) -> Optional[Dict]
         )
 
         proj_dict['readme'] = _fetch_readme(project_id)
+
+        structure = None
+        raw_structure = proj_dict.get('structure_json')
+        if raw_structure:
+            try:
+                structure = json.loads(raw_structure)
+            except (json.JSONDecodeError, TypeError):
+                structure = None
+        proj_dict['structure'] = structure
+        proj_dict['core_excerpts'] = _fetch_core_excerpts(
+            project_id, (structure or {}).get('core_paths') or []
+        )
 
         # Calculate peer percentile
         proj_dict['peer_percentile'] = _calculate_peer_percentile(
