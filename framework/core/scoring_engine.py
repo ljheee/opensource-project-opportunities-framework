@@ -105,7 +105,9 @@ class ScoringEngine:
 
     def calculate_activity_index(self, open_issues: int,
                                   commit_frequency: float,
-                                  pr_merge_rate: Optional[float] = None) -> float:
+                                  pr_merge_rate: Optional[float] = None,
+                                  has_tests: Optional[bool] = None,
+                                  has_ci: Optional[bool] = None) -> float:
         threshold = self._thresholds('activity_index')
         try:
             commit_freq_thresh = max(float(threshold.get('commit_frequency', 3)), 0.0)
@@ -138,6 +140,12 @@ class ScoringEngine:
             score += 0.2
         elif open_issues > 0:
             score += 0.1
+
+        if has_tests is not None or has_ci is not None:
+            if has_tests and has_ci:
+                score += 0.1
+            elif has_tests or has_ci:
+                score += 0.05
 
         return min(score, 1.0)
 
@@ -176,6 +184,21 @@ class ScoringEngine:
             return max(float(self._thresholds('community_buzz').get('default_score', 0.3)), 0.0)
         except (ValueError, TypeError):
             return 0.3
+
+    def calculate_buzz(self, issue_health: Optional[Dict]) -> float:
+        """Real community buzz from L1 issue health. None -> default fallback."""
+        if not issue_health or not isinstance(issue_health, dict):
+            return self.default_buzz_score()
+        t = self._thresholds('community_buzz')
+        def _f(key, default):
+            try:
+                return max(float(t.get(key, default)), 0.0001)
+            except (ValueError, TypeError):
+                return default
+        reaction_score = min((issue_health.get('reaction_total') or 0) / _f('reaction_total_full', 50), 1.0)
+        active_score = min((issue_health.get('active_issues_30d') or 0) / _f('active_issues_full', 5), 1.0)
+        comments_score = min((issue_health.get('avg_comments') or 0) / _f('avg_comments_full', 5), 1.0)
+        return min(reaction_score * 0.5 + active_score * 0.3 + comments_score * 0.2, 1.0)
 
     def calculate_overall(self, star_velocity: float, activity: float,
                           buzz: float, novelty: float) -> Dict[str, Any]:

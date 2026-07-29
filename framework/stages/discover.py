@@ -865,8 +865,18 @@ class DiscoverStage:
             except (ValueError, TypeError):
                 open_issues = 0
             fresh_facts = self._structure_within_budget(project_id, conn)
+            structure = None
+            if fresh_facts:
+                structure = fresh_facts
+            elif proj['structure_json']:
+                try:
+                    structure = json.loads(proj['structure_json'])
+                except (json.JSONDecodeError, TypeError):
+                    structure = None
             activity_score = self.scoring.calculate_activity_index(
-                open_issues, commit_frequency
+                open_issues, commit_frequency,
+                has_tests=(structure or {}).get('has_tests'),
+                has_ci=(structure or {}).get('has_ci')
             )
             contributor_count = proj['contributor_count']
             if contributor_count is None:
@@ -881,7 +891,9 @@ class DiscoverStage:
                 proj['first_commit_at'] or proj['created_at'],
                 contributor_count if contributor_count is not None else 1
             )
-            buzz_score = self.scoring.default_buzz_score()
+            issue_health = (structure or {}).get('issue_health')
+            buzz_score = self.scoring.calculate_buzz(issue_health)
+            buzz_source = 'real' if issue_health else 'fallback'
 
             result = self.scoring.calculate_overall(
                 velocity_score, activity_score, buzz_score, novelty_score
@@ -910,6 +922,7 @@ class DiscoverStage:
                     'stars_21d_ago': stars_21d_ago,
                     'stars_30d_ago': stars_30d_ago,
                     'current_stars': current_stars,
+                    'buzz_source': buzz_source,
                     'synthetic_history': bool(
                         history and proj['first_seen_at']
                         and min(h['sampled_at'] for h in history) < str(proj['first_seen_at'])[:10]

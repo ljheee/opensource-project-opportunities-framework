@@ -17,10 +17,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from framework.core.db import Database
 
-COMPONENTS = ['star_velocity', 'activity_index', 'novelty_signal']
+COMPONENTS = ['star_velocity', 'activity_index', 'community_buzz', 'novelty_signal']
 COMPONENT_COLS = {
     'star_velocity': 'star_velocity_at_pred',
     'activity_index': 'activity_index_at_pred',
+    'community_buzz': 'community_buzz_at_pred',
     'novelty_signal': 'novelty_at_pred',
 }
 
