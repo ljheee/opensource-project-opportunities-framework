@@ -451,6 +451,262 @@ class DiscoverStage:
                 authors.add(str(email).lower())
         return len(authors)
 
+    _SRC_EXTS = ('.py', '.ts', '.tsx', '.rs', '.go', '.ipynb')
+    _GEN_PATTERNS = ('_pb2.py', '.min.js', '.pb.go', '_pb2_grpc.py')
+    _CORE_DIRS = ('src/', 'core/', 'lib/', 'internal/', 'cmd/')
+    _CORE_KEYWORDS = ('model', 'inference', 'engine', 'agent', 'server')
+    _ENTRY_NAMES = ('main', 'app', 'cli', 'server', 'mod', 'index')
+
+    def _select_core_paths(self, paths: List[Dict]) -> Tuple[List[str], Optional[str]]:
+        """Pick up to 3 core source files from tree entries [{path, size}].
+        Two layers: (1) keyword match under core dirs; (2) entry-file fallback.
+        Returns (core_paths, reason) — reason is None, 'no_match'.
+        Skips >100KB files and generated-code patterns.
+        """
+        def _ok(entry):
+            p = entry.get('path') or ''
+            if not p.lower().endswith(self._SRC_EXTS):
+                return False
+            if (entry.get('size') or 0) > 100 * 1024:
+                return False
+            name = p.rsplit('/', 1)[-1].lower()
+            return not any(name.endswith(g) for g in self._GEN_PATTERNS)
+
+        candidates = [e for e in paths if _ok(e)]
+        # Layer 1: keyword match under core dirs
+        layer1 = []
+        for e in candidates:
+            p = e['path'].lower()
+            if any(p.startswith(d) or f'/{d}' in p for d in self._CORE_DIRS):
+                if any(k in p for k in self._CORE_KEYWORDS):
+                    layer1.append(e['path'])
+        if layer1:
+            return sorted(layer1)[:3], None
+        # Layer 2: entry files at root or src/
+        layer2 = []
+        for e in candidates:
+            p = e['path']
+            parts = p.split('/')
+            name = parts[-1].rsplit('.', 1)[0].lower()
+            if len(parts) == 1 and name in self._ENTRY_NAMES:
+                layer2.append(p)
+            elif p in ('src/main.rs', 'src/lib.rs', 'src/main.py', 'src/app.py'):
+                layer2.append(p)
+        if layer2:
+            return sorted(layer2)[:3], None
+        return [], 'no_match'
+
+    def _parse_tree(self, tree_entries: List[Dict], partial: bool) -> Dict:
+        """Extract structural facts from tree entries."""
+        paths = [e for e in tree_entries if isinstance(e, dict) and e.get('type') == 'blob']
+        # 目录条目（type='tree'）也要收集：根目录降级（partial）路径下，
+        # 目录存在性判断完全依赖它们（review 修正：只收 blob 会导致
+        # partial 时 has_tests/has_docs 等恒为 False）
+        root_dirs = {e['path'].lower() for e in tree_entries
+                     if isinstance(e, dict) and e.get('type') == 'tree' and '/' not in (e.get('path') or '')}
+        all_paths = [e.get('path') or '' for e in paths]
+        dirs = {p.split('/')[0].lower() for p in all_paths if p} | root_dirs
+        facts = {
+            'has_tests': any(d in dirs for d in ('tests', 'test')) or any(p.lower().startswith(('tests/', 'test/')) for p in all_paths),
+            'has_ci': any(p.lower().startswith('.github/workflows/') for p in all_paths),
+            'has_docs': 'docs' in dirs or 'doc' in dirs,
+            'has_examples': 'examples' in dirs or 'example' in dirs,
+            'partial': partial,
+        }
+        core_paths, reason = self._select_core_paths(paths)
+        facts['core_paths'] = [] if partial else core_paths
+        facts['core_paths_reason'] = 'partial' if partial else reason
+        # Manifest paths: root manifest first by ecosystem-agnostic priority;
+        # monorepo fallback merges up to 10 nested manifests of the
+        # highest-priority type present (sorted for determinism).
+        manifest_paths: List[str] = []
+        for name in ('pyproject.toml', 'requirements.txt', 'package.json', 'Cargo.toml', 'go.mod'):
+            if name in all_paths:
+                manifest_paths = [name]
+                break
+        if not manifest_paths:
+            for name in ('pyproject.toml', 'requirements.txt', 'package.json', 'Cargo.toml', 'go.mod'):
+                nested = sorted(p for p in all_paths if '/' in p and p.rsplit('/', 1)[-1] == name)
+                if nested:
+                    manifest_paths = nested[:10]
+                    break
+        facts['_manifest_paths'] = manifest_paths
+        return facts
+
+    def _fetch_manifest_deps(self, full_name: str, manifest_paths: List[str]) -> Tuple[List[str], List[str]]:
+        """Fetch dependency manifests via raw (no API quota). Returns (deps, matched).
+        Accepts multiple paths (monorepo); deps are merged in order, deduped.
+        """
+        if not manifest_paths:
+            return [], []
+        deps: List[str] = []
+        seen = set()
+
+        def _add(name: str):
+            if name and name not in seen:
+                seen.add(name)
+                deps.append(name)
+
+        for manifest_path in manifest_paths:
+            try:
+                r = requests.get(
+                    f"https://raw.githubusercontent.com/{full_name}/HEAD/{manifest_path}",
+                    headers={'User-Agent': 'Mozilla/5.0'}, timeout=15
+                )
+                if r.status_code != 200:
+                    continue
+                text = r.text[:200 * 1024]
+            except requests.exceptions.RequestException:
+                continue
+            base = manifest_path.rsplit('/', 1)[-1]
+            if base == 'package.json':
+                try:
+                    pkg = json.loads(text)
+                    for d in sorted(set(list((pkg.get('dependencies') or {}).keys())
+                                    + list((pkg.get('devDependencies') or {}).keys()))):
+                        _add(d)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif base in ('Cargo.toml', 'pyproject.toml'):
+                def _array_names(ls):
+                    # PEP 621 数组元素带版本约束（"langchain-core>=1.4.7,<2.0.0"），
+                    # 需先取引号内容再截断版本/环境标记部分
+                    out = []
+                    for raw in re.findall(r'"([^"]+)"', ls):
+                        n = re.split(r'[\s=><~^;\[!(]', raw, maxsplit=1)[0].strip().strip('\\')
+                        if n and re.match(r'^(?=.*[A-Za-z])[A-Za-z0-9_.-]+$', n):
+                            out.append(n)
+                    return out
+
+                in_deps = False     # poetry/cargo-style [..dependencies] section
+                in_project = False  # PEP 621 [project] section
+                array_continues = False
+                for line in text.splitlines():
+                    ls = line.strip()
+                    if ls.startswith('[') and ls.endswith(']') and '=' not in ls:
+                        # 段头：[dependencies] / [project] / [tool.poetry.dependencies] 等
+                        in_deps = 'dependencies' in ls and 'optional-dependencies' not in ls and 'dev-dependencies' not in ls
+                        in_project = ls == '[project]'
+                        array_continues = False
+                        continue
+                    if in_deps or in_project:
+                        # PEP 621: [project] 段内 dependencies = ["a", "b"] 可能跨行
+                        if ls.startswith('dependencies') and '=' in ls:
+                            array_continues = '[' in ls and ']' not in ls
+                            for n in _array_names(ls):
+                                _add(n)
+                            continue
+                        if array_continues:
+                            for n in _array_names(ls):
+                                _add(n)
+                            if ']' in ls:
+                                array_continues = False
+                            continue
+                        if in_deps and ls and not ls.startswith('#') and '=' in ls:
+                            name = re.split(r'[\s=\[("\'><~^]', ls, maxsplit=1)[0].strip().strip('"\'')
+                            if name and re.match(r'^[A-Za-z0-9_.-]+$', name) and name != 'dependencies':
+                                _add(name)
+            elif base == 'go.mod':
+                for line in text.splitlines():
+                    ls = line.strip()
+                    if not ls or ls.startswith('//'):
+                        continue
+                    first = ls.split()[0] if ls.split() else ''
+                    if first in ('module', 'go', 'require', 'replace', 'exclude', ')', '('):
+                        continue
+                    name = first.strip()
+                    if name and re.match(r'^[A-Za-z0-9_./-]+$', name):
+                        _add(name)
+            else:  # requirements.txt
+                for line in text.splitlines():
+                    ls = line.strip()
+                    if not ls or ls.startswith(('#', '-')):
+                        continue
+                    name = re.split(r'[\s=><~^(;]', ls, maxsplit=1)[0].strip()
+                    if name and re.match(r'^[A-Za-z0-9_.-]+$', name):
+                        _add(name)
+        eco = self.config.get_filters().get('known_ecosystem_packages', [])
+        if not isinstance(eco, list):
+            eco = []
+        eco_set = {str(p).lower() for p in eco}
+        matched = sorted({d for d in deps if d.lower() in eco_set})
+        return deps[:200], matched
+
+    def _fetch_issue_health(self, full_name: str) -> Tuple[Optional[Dict], List[Dict]]:
+        """Top-comment issues (PRs filtered out). Returns (issue_health, top_issues)."""
+        try:
+            repo = self._github_request(f"https://api.github.com/repos/{quote(full_name, safe='/')}")
+            if repo.get('has_issues') is False:
+                return None, []
+            items = self._github_request(
+                f"https://api.github.com/repos/{quote(full_name, safe='/')}/issues",
+                params={"state": "all", "sort": "comments", "direction": "desc", "per_page": 10},
+            )
+        except GitHubAPIError as e:
+            print(f"  Issue health fetch failed for {full_name}: {e}")
+            return None, []
+        if not isinstance(items, list):
+            return None, []
+        issues = [i for i in items if isinstance(i, dict) and 'pull_request' not in i]
+        total_reactions = 0
+        total_comments = 0
+        active_30d = 0
+        now = datetime.now(timezone.utc)
+        for i in issues:
+            total_reactions += int(((i.get('reactions') or {}).get('total_count') or 0))
+            total_comments += int(i.get('comments') or 0)
+            upd = i.get('updated_at') or ''
+            try:
+                if (now - datetime.fromisoformat(upd.replace('Z', '+00:00'))).days <= 30:
+                    active_30d += 1
+            except (ValueError, TypeError):
+                pass
+        health = {
+            'reaction_total': total_reactions,
+            'avg_comments': round(total_comments / len(issues), 1) if issues else 0.0,
+            'active_issues_30d': active_30d,
+            'issue_count': len(issues),
+        }
+        top = [{'title': (i.get('title') or '')[:200],
+                'comments': i.get('comments') or 0,
+                'reactions': int(((i.get('reactions') or {}).get('total_count') or 0))}
+               for i in issues[:5]]
+        return health, top
+
+    def _fetch_structure_facts(self, full_name: str) -> Optional[Dict]:
+        """Collect L1 structural facts for a repo. None on total failure."""
+        try:
+            tree_resp = self._github_request(
+                f"https://api.github.com/repos/{quote(full_name, safe='/')}/git/trees/HEAD",
+                params={"recursive": "1"},
+            )
+        except GitHubAPIError as e:
+            print(f"  Tree fetch failed for {full_name}: {e}")
+            return None
+        entries = tree_resp.get('tree') if isinstance(tree_resp, dict) else None
+        if not isinstance(entries, list):
+            return None
+        partial = bool(tree_resp.get('truncated'))
+        if partial:
+            # Never treat a truncated tree as complete: fall back to root listing
+            try:
+                root_resp = self._github_request(
+                    f"https://api.github.com/repos/{quote(full_name, safe='/')}/git/trees/HEAD"
+                )
+                root_entries = root_resp.get('tree') if isinstance(root_resp, dict) else None
+                if isinstance(root_entries, list):
+                    entries = root_entries
+            except GitHubAPIError:
+                pass
+        facts = self._parse_tree(entries, partial)
+        deps, matched = self._fetch_manifest_deps(full_name, facts.pop('_manifest_paths'))
+        facts['dependencies'] = deps
+        facts['matched_ecosystem_packages'] = matched
+        health, top = self._fetch_issue_health(full_name)
+        facts['issue_health'] = health
+        facts['top_issues'] = top
+        return facts
+
     def _calculate_and_store_burst_score(self, project_id: str, conn=None):
         """Calculate early-burst score from sampled data."""
         should_close = conn is None
