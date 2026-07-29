@@ -583,7 +583,12 @@ conn.commit()
 
 s = DiscoverStage(ConfigLoader(), Database())
 calls = []
-s._fetch_structure_facts = lambda pid: calls.append(pid) or {'has_tests': True, 'issue_health': None, 'top_issues': []} if pid != 'a/p2' else None
+def _fake_fetch(pid):
+    calls.append(pid)
+    if pid == 'a/p2':
+        return None
+    return {'has_tests': True, 'issue_health': None, 'top_issues': []}
+s._fetch_structure_facts = _fake_fetch
 
 # 预算内：p0/p1 成功采集；p2 因预算耗尽（budget=2）不被尝试
 s.config.get_structure_max_per_day = lambda: 2
@@ -606,7 +611,7 @@ assert s._structure_within_budget('a/p0', conn) is None
 # 失败计数：手工制造 3 次失败后应 30 天不重试
 from datetime import datetime as _dt, timezone as _tz
 conn.execute("UPDATE projects SET structure_json = ? WHERE id = 'a/p2'",
-             (j.dumps({'fetched_at': None, 'fail_count': 3, 'last_fail_at': _dt.now(_tz).isoformat()}),))
+             (j.dumps({'fetched_at': None, 'fail_count': 3, 'last_fail_at': _dt.now(_tz.utc).isoformat()}),))
 conn.commit()
 s._structures_done = 0
 assert s._structure_within_budget('a/p2', conn) is None and 'a/p2' not in calls[2:]
