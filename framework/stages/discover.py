@@ -61,6 +61,7 @@ class DiscoverStage:
         self.created_within_days = config.get_created_within_days()
         self._backfills_done = 0
         self._structures_done = 0
+        self._event_rates_done = 0
 
     def _github_request(self, url: str, params: Optional[Dict] = None,
                        is_search: bool = False, headers: Optional[Dict] = None) -> Dict:
@@ -425,6 +426,64 @@ class DiscoverStage:
         if written > 0:
             self._backfills_done += 1
         return written
+
+    def _fetch_recent_star_rate(self, full_name: str) -> Optional[Dict]:
+        """Estimate recent star gain rate from the repo events feed (WatchEvents).
+
+        Replacement for stargazers-timestamp backfill (that endpoint is
+        GitHub-restricted: REST 404 / GraphQL edges stripped, confirmed 2026-07-29
+        in both local and Actions networks). Events retention in practice covers
+        only the most recent ~0.5-6 days, so this yields a *recent* rate, not a
+        full history. WatchEvents are gross star adds (unstars generate no event),
+        so the rate slightly overestimates net velocity — documented bias.
+        """
+        max_pages = 3
+        window_days = 14
+        now = datetime.now(timezone.utc)
+        stars_gained = 0
+        oldest_seen = None
+        for page in range(1, max_pages + 1):
+            try:
+                events = self._github_request(
+                    f"https://api.github.com/repos/{quote(full_name, safe='/')}/events",
+                    params={"per_page": 100, "page": page},
+                )
+            except GitHubAPIError as e:
+                print(f"  Events fetch failed for {full_name}: {e}")
+                return None
+            if not isinstance(events, list) or not events:
+                break
+            page_oldest = None
+            for e in events:
+                if not isinstance(e, dict):
+                    continue
+                ts = e.get('created_at')
+                if not ts:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                except (ValueError, TypeError):
+                    continue
+                if page_oldest is None or dt < page_oldest:
+                    page_oldest = dt
+                if e.get('type') == 'WatchEvent' and (now - dt).days <= window_days:
+                    stars_gained += 1
+            if page_oldest is not None and (oldest_seen is None or page_oldest < oldest_seen):
+                oldest_seen = page_oldest
+            if page_oldest is not None and (now - page_oldest).days >= window_days:
+                break
+            if len(events) < 100:
+                break
+        if oldest_seen is None:
+            return None
+        days_covered = min((now - oldest_seen).total_seconds() / 86400, float(window_days))
+        # Floor the divisor at 1 day: sub-day windows (dense feeds on hot repos
+        # exhaust quickly) would otherwise explode the rate; flooring merely
+        # compresses it — a 126-stars-in-12h burst still scores as a burst.
+        rate_days = max(days_covered, 1.0)
+        return {'stars_gained': stars_gained,
+                'days_covered': round(days_covered, 2),
+                'rate': round(stars_gained / rate_days, 2)}
 
     def _fetch_weekly_contributors(self, full_name: str) -> Optional[int]:
         """Count distinct commit authors in the last 7 days. None on failure."""
@@ -839,9 +898,22 @@ class DiscoverStage:
                     stars_30d_ago = sample_stars
 
             # Calculate scores (acceleration-aware when 14d+ data exists)
-            velocity_score = self.scoring.calculate_star_velocity(
-                current_stars, stars_7d_ago, stars_14d_ago, stars_21d_ago, stars_30d_ago
-            )
+            # When no usable history exists, fall back to an events-derived
+            # recent star rate (budgeted like backfill) instead of the flat 0.5.
+            velocity_source = 'history' if (stars_7d_ago is not None or stars_30d_ago is not None) else 'fallback'
+            event_rate = None
+            if (velocity_source == 'fallback'
+                    and self._event_rates_done < self.config.get_backfill_config()['max_per_day']):
+                event_rate = self._fetch_recent_star_rate(project_id)
+                self._event_rates_done += 1
+            if event_rate:
+                pseudo_past_7d = max(current_stars - int(round(event_rate['rate'] * 7)), 0)
+                velocity_score = self.scoring.calculate_star_velocity(current_stars, pseudo_past_7d)
+                velocity_source = 'events'
+            else:
+                velocity_score = self.scoring.calculate_star_velocity(
+                    current_stars, stars_7d_ago, stars_14d_ago, stars_21d_ago, stars_30d_ago
+                )
             # Estimate commit frequency from last push date (pushed_at -> last_commit_at)
             last_commit = proj['last_commit_at'] or ''
             commit_frequency = 1.0
@@ -923,6 +995,8 @@ class DiscoverStage:
                     'stars_30d_ago': stars_30d_ago,
                     'current_stars': current_stars,
                     'buzz_source': buzz_source,
+                    'velocity_source': velocity_source,
+                    'recent_star_rate': event_rate,
                     'synthetic_history': bool(
                         history and proj['first_seen_at']
                         and min(h['sampled_at'] for h in history) < str(proj['first_seen_at'])[:10]
