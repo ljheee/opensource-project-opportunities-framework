@@ -42,9 +42,8 @@ sources:
     languages: ["Python", "TypeScript", "Rust", "Go"]
     star_range: [50, 50000]
     created_within_days: 730
-    backfill_max_pages: 30
-    backfill_max_per_day: 50
     structure_max_per_day: 50
+    event_rate_max_per_day: 50
 
   trending:
     languages: ["python", "typescript", "rust", "go"]

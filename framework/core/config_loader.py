@@ -112,18 +112,13 @@ class ConfigLoader:
             return 730
         return val if val > 0 else 730
 
-    def get_backfill_config(self) -> Dict:
-        gh = ((self.load().get('sources') or {}).get('github') or {})
-        def _pos_int(key, default):
-            try:
-                val = int(gh.get(key, default))
-            except (ValueError, TypeError):
-                return default
-            return val if val > 0 else default
-        return {
-            'max_pages': _pos_int('backfill_max_pages', 30),
-            'max_per_day': _pos_int('backfill_max_per_day', 50),
-        }
+    def get_event_rate_max_per_day(self) -> int:
+        raw = ((self.load().get('sources') or {}).get('github') or {}).get('event_rate_max_per_day', 50)
+        try:
+            val = int(raw)
+        except (ValueError, TypeError):
+            return 50
+        return val if val > 0 else 50
 
     def get_structure_max_per_day(self) -> int:
         raw = ((self.load().get('sources') or {}).get('github') or {}).get('structure_max_per_day', 50)

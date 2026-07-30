@@ -59,7 +59,6 @@ class DiscoverStage:
         self.resilience = config.get_resilience_config()
         self.star_min, self.star_max = config.get_star_range()
         self.created_within_days = config.get_created_within_days()
-        self._backfills_done = 0
         self._structures_done = 0
         self._event_rates_done = 0
 
@@ -322,111 +321,6 @@ class DiscoverStage:
         """Sample current star count for velocity tracking."""
         self.db.sample_star_count(project_id, stars, conn=conn)
 
-    def _fetch_stargazer_timestamps(self, full_name: str, stars: int) -> List[str]:
-        """Fetch starred_at timestamps, newest first, bounded by backfill config."""
-        cfg = self.config.get_backfill_config()
-        max_pages = cfg['max_pages']
-        if stars <= 0:
-            return []
-        # GitHub stargazers endpoint only serves the first 400 pages (page>400 -> 422)
-        last_page = min((stars + 99) // 100, 400)
-        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=35)).date()
-        timestamps: List[str] = []
-        pages_fetched = 0
-        for page in range(last_page, 0, -1):
-            if pages_fetched >= max_pages:
-                break
-            try:
-                data = self._github_request(
-                    f"https://api.github.com/repos/{quote(full_name, safe='/')}/stargazers",
-                    params={"per_page": 100, "page": page},
-                    headers={'Accept': 'application/vnd.github.star+json'},
-                )
-            except GitHubAPIError as e:
-                print(f"  Backfill page {page} failed for {full_name}: {e}")
-                break
-            pages_fetched += 1
-            if not isinstance(data, list):
-                break
-            page_earliest = None
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                ts = item.get('starred_at')
-                if not ts:
-                    continue
-                timestamps.append(ts)
-                try:
-                    d = datetime.fromisoformat(ts.replace('Z', '+00:00')).date()
-                except (ValueError, TypeError):
-                    continue
-                if page_earliest is None or d < page_earliest:
-                    page_earliest = d
-            # Stop when the whole page is older than the 35-day window
-            if page_earliest is not None and page_earliest < cutoff_date:
-                break
-        return timestamps
-
-    def _backfill_star_history(self, project_id: str, stars: int, conn=None) -> int:
-        """Rebuild daily star history from stargazer timestamps (first-seen projects).
-
-        Returns number of synthetic rows written. Skips when the project already
-        has >= 7 star_history samples (a full velocity window of real depth, or a
-        previous backfill). Skips also when rows span >= 3 distinct dates, which
-        marks a completed backfill even when it produced fewer than 7 rows (stars
-        concentrated on few days); legacy projects carry a single early sample on
-        one date, so they still backfill. Synthetic rows use 'YYYY-MM-DD' dates to
-        match db.sample_star_count's date(?) format and UNIQUE(project_id, sampled_at).
-        """
-        should_close = conn is None
-        conn = conn or self.db.get_conn()
-        try:
-            row = conn.execute(
-                'SELECT COUNT(*) AS c, COUNT(DISTINCT sampled_at) AS d '
-                'FROM star_history WHERE project_id = ?',
-                (project_id,)
-            ).fetchone()
-            if row['c'] >= 7 or row['d'] >= 3:
-                return 0
-            timestamps = self._fetch_stargazer_timestamps(project_id, stars)
-            if not timestamps:
-                return 0
-            # Count stars per UTC date; accumulate oldest -> newest
-            per_day: Dict[str, int] = {}
-            for ts in timestamps:
-                day = ts[:10]
-                per_day[day] = per_day.get(day, 0) + 1
-            # Total stars covered by fetched timestamps; stars before the oldest
-            # fetched timestamp form the baseline so curves end at current count.
-            covered = len(timestamps)
-            baseline = max(stars - covered, 0)
-            written = 0
-            cumulative = baseline
-            for day in sorted(per_day):
-                cumulative += per_day[day]
-                conn.execute(
-                    'INSERT OR IGNORE INTO star_history (project_id, sampled_at, stars) VALUES (?, ?, ?)',
-                    (project_id, day, cumulative)
-                )
-                written += 1
-            if should_close:
-                conn.commit()
-            print(f"  Backfilled {written} days of star history for {project_id}")
-            return written
-        finally:
-            if should_close:
-                conn.close()
-
-    def _backfill_within_budget(self, project_id: str, stars: int, conn) -> int:
-        """Backfill one project if the daily budget allows. Returns rows written."""
-        budget = self.config.get_backfill_config()['max_per_day']
-        if self._backfills_done >= budget:
-            return 0
-        written = self._backfill_star_history(project_id, stars, conn=conn)
-        if written > 0:
-            self._backfills_done += 1
-        return written
-
     def _fetch_recent_star_rate(self, full_name: str) -> Optional[Dict]:
         """Estimate recent star gain rate from the repo events feed (WatchEvents).
 
@@ -438,7 +332,10 @@ class DiscoverStage:
         so the rate slightly overestimates net velocity — documented bias.
         """
         max_pages = 3
-        window_days = 14
+        # 7-day window matching the 7-day velocity extrapolation below — a wider
+        # counting window would smear old bursts into "bursting now" (review H1).
+        window_days = 7
+        window_seconds = window_days * 86400
         now = datetime.now(timezone.utc)
         stars_gained = 0
         oldest_seen = None
@@ -466,7 +363,8 @@ class DiscoverStage:
                     continue
                 if page_oldest is None or dt < page_oldest:
                     page_oldest = dt
-                if e.get('type') == 'WatchEvent' and (now - dt).days <= window_days:
+                if (e.get('type') == 'WatchEvent'
+                        and 0 <= (now - dt).total_seconds() <= window_seconds):
                     stars_gained += 1
             if page_oldest is not None and (oldest_seen is None or page_oldest < oldest_seen):
                 oldest_seen = page_oldest
@@ -903,14 +801,15 @@ class DiscoverStage:
             velocity_source = 'history' if (stars_7d_ago is not None or stars_30d_ago is not None) else 'fallback'
             event_rate = None
             if (velocity_source == 'fallback'
-                    and self._event_rates_done < self.config.get_backfill_config()['max_per_day']):
+                    and self._event_rates_done < self.config.get_event_rate_max_per_day()):
                 event_rate = self._fetch_recent_star_rate(project_id)
                 self._event_rates_done += 1
-            if event_rate:
+            if event_rate and event_rate['stars_gained'] > 0:
                 pseudo_past_7d = max(current_stars - int(round(event_rate['rate'] * 7)), 0)
                 velocity_score = self.scoring.calculate_star_velocity(current_stars, pseudo_past_7d)
                 velocity_source = 'events'
             else:
+                event_rate = None
                 velocity_score = self.scoring.calculate_star_velocity(
                     current_stars, stars_7d_ago, stars_14d_ago, stars_21d_ago, stars_30d_ago
                 )
@@ -1248,7 +1147,6 @@ class DiscoverStage:
                     )
                     stored_count += 1
                     new_stars = (item.get('repo') or {}).get('stargazers_count') or 0
-                    self._backfill_within_budget(project_id, new_stars, conn=conn)
                     self._sample_star_count(
                         project_id,
                         new_stars,
@@ -1265,11 +1163,14 @@ class DiscoverStage:
         print(f"\nStored {stored_count} projects")
 
         # Sample star counts for existing active projects
+        # Newest-first: the events-rate budget serves recent discoveries before
+        # long-tail legacy projects (review M1).
         print("\nSampling star history for existing projects...")
         conn = self.db.get_conn()
         try:
             active_projects = conn.execute(
-                "SELECT id, stars FROM projects WHERE status IN ('scheduled', 'active')"
+                "SELECT id, stars FROM projects WHERE status IN ('scheduled', 'active') "
+                "ORDER BY first_seen_at DESC"
             ).fetchall()
 
             sampled = 0
@@ -1279,7 +1180,6 @@ class DiscoverStage:
                         proj_stars = int(proj['stars']) if proj['stars'] is not None else 0
                     except (ValueError, TypeError):
                         proj_stars = 0
-                    self._backfill_within_budget(proj['id'], proj_stars, conn=conn)
                     self._sample_star_count(proj['id'], proj_stars, conn=conn)
                     self._calculate_and_store_burst_score(proj['id'], conn=conn)
                     sampled += 1
