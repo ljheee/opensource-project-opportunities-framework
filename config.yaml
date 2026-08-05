@@ -44,6 +44,7 @@ sources:
     created_within_days: 730
     structure_max_per_day: 50
     event_rate_max_per_day: 50
+    contributors_max_per_day: 100
 
   trending:
     languages: ["python", "typescript", "rust", "go"]

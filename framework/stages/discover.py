@@ -61,6 +61,7 @@ class DiscoverStage:
         self.created_within_days = config.get_created_within_days()
         self._structures_done = 0
         self._event_rates_done = 0
+        self._contributors_done = 0
 
     def _github_request(self, url: str, params: Optional[Dict] = None,
                        is_search: bool = False, headers: Optional[Dict] = None) -> Dict:
@@ -850,17 +851,25 @@ class DiscoverStage:
                 has_ci=(structure or {}).get('has_ci')
             )
             contributor_count = proj['contributor_count']
-            if contributor_count is None:
-                fetched = self._fetch_weekly_contributors(project_id)
-                if fetched is not None:
-                    contributor_count = fetched
+            # contributor_count semantics: NULL = never tried; >= 0 = real count;
+            # negative = consecutive fetch failures (-3 and below = fused, no retry).
+            # Budgeted like the other collectors (review: this was the only
+            # unbudgeted API consumer; failing repos retried every run forever).
+            if contributor_count is None or (contributor_count < 0 and contributor_count > -3):
+                if self._contributors_done < self.config.get_contributors_max_per_day():
+                    self._contributors_done += 1
+                    fetched = self._fetch_weekly_contributors(project_id)
+                    if fetched is not None:
+                        contributor_count = fetched
+                    else:
+                        contributor_count = (contributor_count or 0) - 1
                     conn.execute(
                         'UPDATE projects SET contributor_count = ? WHERE id = ?',
-                        (fetched, project_id)
+                        (contributor_count, project_id)
                     )
             novelty_score = self.scoring.calculate_novelty(
                 proj['first_commit_at'] or proj['created_at'],
-                contributor_count if contributor_count is not None else 1
+                contributor_count if contributor_count is not None and contributor_count >= 0 else 1
             )
             issue_health = (structure or {}).get('issue_health')
             buzz_score = self.scoring.calculate_buzz(issue_health)

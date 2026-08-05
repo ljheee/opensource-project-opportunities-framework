@@ -113,20 +113,21 @@ class ReportGenerator:
                 ORDER BY count DESC
             ''').fetchall()
 
-            # Top opportunities sorted by impact_potential and overall_score
-            # Use latest analysis per project to avoid Cartesian product
+            # Top opportunities sorted by impact_potential and overall_score.
+            # Join each opportunity to the analysis that GENERATED it
+            # (analyzed_at = source_analysis_date) so its score is the one it
+            # earned — not whatever the project's latest analysis scored.
+            # Exclude heuristic/template analyses (they produce no real opportunities;
+            # legacy v1.0 rows are pre-tagging template output).
             top_opportunities = conn.execute('''
                 SELECT o.*, p.name as project_name, p.url as project_url, a.overall_score
                 FROM opportunities o
                 JOIN projects p ON o.project_id = p.id
-                LEFT JOIN (
-                    SELECT project_id, overall_score,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY project_id ORDER BY analyzed_at DESC
-                           ) as rn
-                    FROM analyses
-                ) a ON a.project_id = p.id AND a.rn = 1
+                LEFT JOIN analyses a
+                    ON a.project_id = o.project_id
+                    AND a.analyzed_at = o.source_analysis_date
                 WHERE o.status = 'open'
+                  AND COALESCE(a.analyzer_version, '') NOT IN ('heuristic-v1', 'v1.0')
                 ORDER BY
                     CASE o.impact_potential
                         WHEN 'high' THEN 3

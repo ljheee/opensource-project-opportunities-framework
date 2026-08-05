@@ -120,6 +120,14 @@ class ConfigLoader:
             return 50
         return val if val > 0 else 50
 
+    def get_contributors_max_per_day(self) -> int:
+        raw = ((self.load().get('sources') or {}).get('github') or {}).get('contributors_max_per_day', 100)
+        try:
+            val = int(raw)
+        except (ValueError, TypeError):
+            return 100
+        return val if val > 0 else 100
+
     def get_structure_max_per_day(self) -> int:
         raw = ((self.load().get('sources') or {}).get('github') or {}).get('structure_max_per_day', 50)
         try:
