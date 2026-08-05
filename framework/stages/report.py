@@ -192,7 +192,8 @@ class ReportGenerator:
                 tp_trending = int(conn.execute('''
                     SELECT COUNT(*) FROM prediction_outcomes po
                     JOIN projects p ON po.project_id = p.id
-                    WHERE po.outcome = 'true_positive' AND p.source = 'trending'
+                    WHERE po.outcome = 'true_positive'
+                      AND COALESCE(po.source_at_pred, p.source) = 'trending'
                 ''').fetchone()[0] or 0)
                 if tp_trending + fn_count > 0:
                     recall = tp_trending / (tp_trending + fn_count)

@@ -48,12 +48,12 @@ jobs:
       - name: Analyze
         run: python framework/stages/analyze.py --date "$(date -u +%Y-%m-%d)"
 
-      - name: Report
-        run: python framework/stages/report.py --date "$(date -u +%Y-%m-%d)"
-
       - name: Validate Predictions
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'bulk'
         run: python framework/stages/validate.py
+
+      - name: Report
+        run: python framework/stages/report.py --date "$(date -u +%Y-%m-%d)"
 
       - name: Auto-tune Weights
         if: github.event_name == 'schedule'

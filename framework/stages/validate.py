@@ -43,6 +43,7 @@ def record_new_predictions(db: Database, min_days_for_fn: int = 7):
         # and no prediction_outcome record exists yet
         cur = conn.execute('''
             SELECT e.project_id, e.calculated_at, e.overall_score, p.stars,
+                   p.source as source_at_pred,
                    e.star_velocity_score, e.activity_index_score,
                    e.community_buzz_score, e.novelty_score
             FROM early_burst_signals e
@@ -70,14 +71,14 @@ def record_new_predictions(db: Database, min_days_for_fn: int = 7):
                  overall_score_at_prediction,
                  star_velocity_at_pred, activity_index_at_pred,
                  community_buzz_at_pred, novelty_at_pred,
-                 growth_rate_predicted,
+                 growth_rate_predicted, source_at_pred,
                  checked_at, outcome)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, date('now'), 'pending')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, date('now'), 'pending')
             ''', (row['project_id'], row['calculated_at'],
                   row['stars'], row['overall_score'],
                   row['star_velocity_score'], row['activity_index_score'],
                   row['community_buzz_score'], row['novelty_score'],
-                  predicted_growth))
+                  predicted_growth, row['source_at_pred']))
             recorded += 1
 
         # FN candidates: trending-source projects that did NOT reach early-burst,
@@ -85,6 +86,7 @@ def record_new_predictions(db: Database, min_days_for_fn: int = 7):
         fn_threshold = _fn_threshold()
         fn_cur = conn.execute('''
             SELECT p.id as project_id, p.first_seen_at, p.stars,
+                   p.source as source_at_pred,
                    e.overall_score, e.calculated_at
             FROM projects p
             JOIN (
@@ -119,12 +121,12 @@ def record_new_predictions(db: Database, min_days_for_fn: int = 7):
                  overall_score_at_prediction,
                  star_velocity_at_pred, activity_index_at_pred,
                  community_buzz_at_pred, novelty_at_pred,
-                 growth_rate_predicted,
+                 growth_rate_predicted, source_at_pred,
                  checked_at, outcome)
-                VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 'pending')
+                VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, 'pending')
             ''', (row['project_id'], row['first_seen_at'],
                   baseline_stars, row['overall_score'],
-                  fn_threshold, checked_at))
+                  fn_threshold, row['source_at_pred'], checked_at))
             fn_recorded += 1
         print(f"Recorded {fn_recorded} new FN candidates")
 
@@ -290,7 +292,8 @@ def print_metrics(db: Database):
             tp_trending = int(conn.execute('''
                 SELECT COUNT(*) FROM prediction_outcomes po
                 JOIN projects p ON po.project_id = p.id
-                WHERE po.outcome = 'true_positive' AND p.source = 'trending'
+                WHERE po.outcome = 'true_positive'
+                  AND COALESCE(po.source_at_pred, p.source) = 'trending'
             ''').fetchone()[0] or 0)
             print(f"Recall candidates — FN (missed bursts): {fn}, TN: {tn}")
             if tp_trending + fn > 0:
