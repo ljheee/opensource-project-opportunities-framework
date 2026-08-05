@@ -798,7 +798,7 @@ class DiscoverStage:
 
             # Calculate scores (acceleration-aware when 14d+ data exists)
             # When no usable history exists, fall back to an events-derived
-            # recent star rate (budgeted like backfill) instead of the flat 0.5.
+            # recent star rate (daily-budgeted) instead of the flat 0.5.
             velocity_source = 'history' if (stars_7d_ago is not None or stars_30d_ago is not None) else 'fallback'
             event_rate = None
             if (velocity_source == 'fallback'
@@ -810,7 +810,8 @@ class DiscoverStage:
                 velocity_score = self.scoring.calculate_star_velocity(current_stars, pseudo_past_7d)
                 velocity_source = 'events'
             else:
-                event_rate = None
+                # 保留零增速的 recent_star_rate 记录（区分"已查无增长"与"未查"），
+                # 只门控 velocity_source 标签（review 低-2）
                 velocity_score = self.scoring.calculate_star_velocity(
                     current_stars, stars_7d_ago, stars_14d_ago, stars_21d_ago, stars_30d_ago
                 )

@@ -127,7 +127,8 @@ class ReportGenerator:
                     ON a.project_id = o.project_id
                     AND a.analyzed_at = o.source_analysis_date
                 WHERE o.status = 'open'
-                  AND COALESCE(a.analyzer_version, '') NOT IN ('heuristic-v1', 'v1.0')
+                  AND a.id IS NOT NULL
+                  AND a.analyzer_version NOT IN ('heuristic-v1', 'v1.0')
                 ORDER BY
                     CASE o.impact_potential
                         WHEN 'high' THEN 3

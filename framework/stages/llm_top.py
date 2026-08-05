@@ -42,6 +42,12 @@ def get_llm_candidates(db: Database, limit: int) -> list:
             ) latest ON e.project_id = latest.project_id
                      AND e.calculated_at = latest.latest_at
             WHERE e.is_early_burst = 1
+              AND EXISTS (
+                  -- 只重分析已完成过任务的项目：否则 CI 的 heuristic 任务仍会排期，
+                  -- 更新的 heuristic-v1 行会盖过本分析的分类输出（review 中-2）
+                  SELECT 1 FROM tasks t
+                  WHERE t.project_id = e.project_id AND t.status = 'done'
+              )
               AND NOT EXISTS (
                   SELECT 1 FROM analyses a
                   WHERE a.project_id = e.project_id

@@ -307,6 +307,7 @@ class Database:
                 community_buzz_at_pred REAL,
                 novelty_at_pred REAL,
                 growth_rate_predicted REAL,
+                source_at_pred TEXT,
                 checked_at TEXT,
                 stars_now INTEGER,
                 growth_rate_actual REAL,
