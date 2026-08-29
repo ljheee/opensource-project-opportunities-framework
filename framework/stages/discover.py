@@ -103,11 +103,16 @@ class DiscoverStage:
         """
         global _last_request_time
 
-        # Rate limiting for search API
+        # Rate limiting for search API. Bumped from 2s to 5s after the
+        # 2026-08-29 incident: 6 topic × 4 language searches = 24 calls
+        # in a tight loop hit GitHub's search-API 30/min ceiling and
+        # produced back-to-back 60s primary-rate-limit sleeps that
+        # stretched discover to 19+ minutes (effectively 6h on a typical
+        # Actions run). 5s spacing = 12 calls/min, well under the cap.
         if is_search:
             elapsed = time.time() - _last_request_time
-            if elapsed < 2:
-                time.sleep(max(0, 2 - elapsed))
+            if elapsed < 5:
+                time.sleep(max(0, 5 - elapsed))
         else:
             elapsed = time.time() - _last_request_time
             if elapsed < 0.5:

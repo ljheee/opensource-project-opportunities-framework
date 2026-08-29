@@ -23,6 +23,11 @@ jobs:
     env:
       MODE: ${{ github.event.inputs.mode || 'incremental' }}
       GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      # Disable Python output buffering so print() shows up in real time.
+      # Without this, stdout is fully-buffered when not a tty, and a long
+      # run shows ZERO log output until the process exits (or is killed).
+      # That was the diagnostic gap behind the 2026-08-28 6h hang.
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,29 +36,29 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Init DB
-        run: python framework/stages/init_db.py
+        run: python -u framework/stages/init_db.py
 
       - name: Crash Recovery
-        run: python -c "from framework.core.db import Database; db = Database(); db.repair_analyzing_status(); db.repair_orphan_records()"
+        run: python -u -c "from framework.core.db import Database; db = Database(); db.repair_analyzing_status(); db.repair_orphan_records()"
 
       - name: Discover
-        run: python framework/stages/discover.py
+        run: python -u framework/stages/discover.py
 
       - name: Filter
-        run: python framework/stages/filter.py
+        run: python -u framework/stages/filter.py
 
       - name: Schedule
-        run: python framework/stages/schedule.py --mode "$MODE"
+        run: python -u framework/stages/schedule.py --mode "$MODE"
 
       - name: Analyze
-        run: python framework/stages/analyze.py --date "$(date -u +%Y-%m-%d)"
+        run: python -u framework/stages/analyze.py --date "$(date -u +%Y-%m-%d)"
 
       - name: Validate Predictions
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'bulk'
-        run: python framework/stages/validate.py
+        run: python -u framework/stages/validate.py
 
       - name: Report
-        run: python framework/stages/report.py --date "$(date -u +%Y-%m-%d)"
+        run: python -u framework/stages/report.py --date "$(date -u +%Y-%m-%d)"
 
       - name: Auto-tune Weights
         if: github.event_name == 'schedule'
