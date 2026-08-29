@@ -22,11 +22,16 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MODE: ${{ github.event.inputs.mode || 'incremental' }}
-      GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      # Use the workflow-managed GITHUB_TOKEN (auto-injected, never expires)
+      # instead of secrets.GH_TOKEN, which started returning 401 on
+      # 2026-08-14 and turned the discover stage into 3-retry × 60-180s
+      # sleeps per search URL = ~72 min before raising. The
+      # 'permissions: contents: write' above already gives this token
+      # the scope it needs to push commits.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Disable Python output buffering so print() shows up in real time.
       # Without this, stdout is fully-buffered when not a tty, and a long
       # run shows ZERO log output until the process exits (or is killed).
-      # That was the diagnostic gap behind the 2026-08-28 6h hang.
       PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
