@@ -40,7 +40,12 @@ sources:
       - "generative-ai"
       - "ai-agents"
     languages: ["Python", "TypeScript", "Rust", "Go"]
-    star_range: [50, 50000]
+    # Tightened from [50, 50000] after 2026-08-29 incident: lower bound
+    # filtered out 665 marginal repos (DB census), upper bound filtered 327
+    # saturated repos that no longer exhibit early-burst signal. Combined
+    # cut reduces per-run candidate pool by ~42%, which directly lowers
+    # secondary rate limit pressure (see discover.py circuit breaker).
+    star_range: [200, 20000]
     created_within_days: 730
     structure_max_per_day: 50
     event_rate_max_per_day: 50
@@ -156,6 +161,15 @@ resilience:
   github_api:
     max_retries: 3
     retry_delay_seconds: 60
+    # Circuit breaker for GitHub's secondary (abuse) rate limit. After
+    # `secondary_limit_threshold` consecutive secondary-rate-limit hits,
+    # the discover stage abandons remaining per-project API work and
+    # falls through to filter/schedule/analyze with whatever was already
+    # fetched. `secondary_pause_seconds` is the per-hit sleep before
+    # skipping the offending URL (retrying immediately extends the ban).
+    circuit_breaker:
+      secondary_limit_threshold: 5
+      secondary_pause_seconds: 30
   llm_analysis:
     max_retries: 2
     timeout_seconds: 300

@@ -5,6 +5,12 @@ FRAMEWORK_DIR="$(cd "$(dirname "$0")" && pwd)"
 DB="$FRAMEWORK_DIR/data/framework.db"
 DATE=$(date -u +%Y-%m-%d)
 
+# Disable Python output buffering so that `print(...)` from framework stages
+# shows up in real time (otherwise stdout is fully-buffered when not a tty,
+# which made the 2026-08-29 stuck-discover incident impossible to diagnose
+# from the log file until the 6-hour GitHub Actions timeout).
+export PYTHONUNBUFFERED=1
+
 # Load environment
 if [ -f "$FRAMEWORK_DIR/.env" ]; then
   set -a; source "$FRAMEWORK_DIR/.env"; set +a

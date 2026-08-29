@@ -42,6 +42,16 @@ class GitHubAPIError(Exception):
         self.retry_after = retry_after
 
 
+class SecondaryRateLimitError(GitHubAPIError):
+    """Raised when GitHub returns 403/429 indicating a secondary (abuse) rate limit.
+
+    Distinguished from primary rate limit (which has a known X-RateLimit-Reset).
+    Secondary limits have no documented retry duration — retrying immediately
+    extends the ban. Callers should skip the current project and let the
+    circuit breaker decide whether to abort the stage.
+    """
+
+
 def _to_bool(val) -> bool:
     """Coerce config value to bool (handles string 'false', '0', etc.)."""
     if isinstance(val, str):
@@ -62,6 +72,27 @@ class DiscoverStage:
         self._structures_done = 0
         self._event_rates_done = 0
         self._contributors_done = 0
+        # Circuit breaker for GitHub secondary rate limits. Once tripped, the
+        # stage skips remaining per-project API work and falls back to local
+        # signals only (sampling/filtering still run on what's already cached).
+        # The break is sticky for the lifetime of this DiscoverStage instance.
+        self._cb_secondary_limit_count = 0
+        self._cb_tripped = False
+        cb_cfg = (self.resilience.get('github_api') or {}).get('circuit_breaker') or {}
+        try:
+            self._cb_threshold = int(cb_cfg.get('secondary_limit_threshold', 5))
+        except (ValueError, TypeError):
+            self._cb_threshold = 5
+        if self._cb_threshold < 1:
+            self._cb_threshold = 1
+        # Per-request sleep after a secondary rate limit is hit (per-project
+        # backoff). Distinct from primary rate limit, which respects
+        # X-RateLimit-Reset / Retry-After.
+        try:
+            self._secondary_pause = max(
+                int(cb_cfg.get('secondary_pause_seconds', 30)), 0)
+        except (ValueError, TypeError):
+            self._secondary_pause = 30
 
     def _github_request(self, url: str, params: Optional[Dict] = None,
                        is_search: bool = False, headers: Optional[Dict] = None) -> Dict:
@@ -97,6 +128,12 @@ class DiscoverStage:
         for attempt in range(max_retries):
             try:
                 req_headers = {**HEADERS, **headers} if headers else HEADERS
+                # Force Connection: close so the requests connection pool does
+                # not hold sockets open across the per-project loop. Without
+                # this, a slow GitHub response can pin 3+ sockets in
+                # ESTABLISHED state, and the next batch triggers TCP-level
+                # abuse detection (SYN_SENT backpressure seen in #4 incident).
+                req_headers.setdefault('Connection', 'close')
                 response = requests.get(
                     url,
                     headers=req_headers,
@@ -105,8 +142,49 @@ class DiscoverStage:
                 )
                 _last_request_time = time.time()
 
+                body_lower = response.text.lower()
+                # GitHub secondary (abuse) rate limit signals: status 403
+                # with "secondary rate limit" in body, or 429 without a
+                # useful Retry-After. Primary limit has X-RateLimit-Reset
+                # and body mentions "API rate limit exceeded".
+                is_secondary = (
+                    'secondary rate limit' in body_lower
+                    or 'abuse detection' in body_lower
+                )
+                is_primary = (
+                    response.status_code == 403
+                    and 'rate limit' in body_lower
+                    and not is_secondary
+                )
+
+                if is_secondary:
+                    # Do not retry — secondary limits penalise rapid retries.
+                    # Caller decides whether to skip this project; circuit
+                    # breaker (if tripped) will abort the stage.
+                    self._cb_secondary_limit_count += 1
+                    if self._cb_secondary_limit_count >= self._cb_threshold:
+                        self._cb_tripped = True
+                        print(
+                            f"  Secondary rate limit hit "
+                            f"{self._cb_secondary_limit_count} times; "
+                            f"circuit breaker tripped — abandoning remaining "
+                            f"per-project API work."
+                        )
+                    else:
+                        print(
+                            f"  Secondary rate limit ({self._cb_secondary_limit_count}"
+                            f"/{self._cb_threshold}). Pausing "
+                            f"{self._secondary_pause}s and skipping URL."
+                        )
+                        if self._secondary_pause:
+                            time.sleep(self._secondary_pause)
+                    raise SecondaryRateLimitError(
+                        f"Secondary rate limit for {url}",
+                        status_code=response.status_code,
+                    )
+
                 # Handle rate limiting
-                if response.status_code == 403 and 'rate limit' in response.text.lower():
+                if is_primary:
                     if attempt >= max_retries - 1:
                         raise GitHubAPIError(f"Rate limited after {attempt + 1} attempts")
                     try:
@@ -119,12 +197,36 @@ class DiscoverStage:
                     continue
 
                 if response.status_code == 429:
+                    # 429 without secondary markers is still a soft signal —
+                    # honour Retry-After if present, otherwise treat as
+                    # secondary (no useful reset header).
+                    try:
+                        retry_after = int(response.headers.get('Retry-After') or 0)
+                    except (ValueError, TypeError):
+                        retry_after = 0
+                    if retry_after <= 0:
+                        # No header — treat as secondary to avoid tight retry loops.
+                        self._cb_secondary_limit_count += 1
+                        if self._cb_secondary_limit_count >= self._cb_threshold:
+                            self._cb_tripped = True
+                            print(
+                                f"  429 without Retry-After (count "
+                                f"{self._cb_secondary_limit_count}/"
+                                f"{self._cb_threshold}); circuit breaker tripped."
+                            )
+                        else:
+                            print(
+                                f"  429 without Retry-After. Pausing "
+                                f"{self._secondary_pause}s and skipping URL."
+                            )
+                            if self._secondary_pause:
+                                time.sleep(self._secondary_pause)
+                        raise SecondaryRateLimitError(
+                            f"429 without Retry-After for {url}",
+                            status_code=429,
+                        )
                     if attempt >= max_retries - 1:
                         raise GitHubAPIError(f"Too many requests after {attempt + 1} attempts")
-                    try:
-                        retry_after = max(int(response.headers.get('Retry-After') or 60), 0)
-                    except (ValueError, TypeError):
-                        retry_after = 60
                     print(f"  Too many requests. Waiting {retry_after}s...")
                     time.sleep(min(retry_after, retry_delay))
                     continue
@@ -147,6 +249,10 @@ class DiscoverStage:
                     raise GitHubAPIError(f"Failed after {attempt + 1} attempts: {e}")
 
         raise GitHubAPIError("Unexpected end of retry loop")
+
+    @property
+    def circuit_breaker_tripped(self) -> bool:
+        return self._cb_tripped
 
     def _should_skip_repo(self, repo: Dict) -> Tuple[bool, str]:
         """Check if repository should be skipped based on filters."""
@@ -1147,6 +1253,8 @@ class DiscoverStage:
         # Store results
         print("\nStoring projects...")
         stored_count = 0
+        scored_count = 0
+        skipped_cb = 0
         conn = self.db.get_conn()
         try:
             for item in unique_results:
@@ -1162,7 +1270,20 @@ class DiscoverStage:
                         new_stars,
                         conn=conn
                     )
+                    if self._cb_tripped:
+                        # Project row is persisted (cheap, no network) but
+                        # we skip the burst-score fetch which needs API.
+                        skipped_cb += 1
+                        continue
                     self._calculate_and_store_burst_score(project_id, conn=conn)
+                    scored_count += 1
+                    if self._cb_tripped:
+                        print(
+                            f"  Circuit breaker tripped during score loop; "
+                            f"stopping with {scored_count} scored, "
+                            f"{skipped_cb} deferred."
+                        )
+                        break
                 except Exception as e:
                     repo_name = (item.get('repo') or {}).get('full_name', 'unknown')
                     print(f"  Error storing {repo_name}: {e}")
@@ -1170,7 +1291,13 @@ class DiscoverStage:
         finally:
             conn.close()
 
-        print(f"\nStored {stored_count} projects")
+        if skipped_cb:
+            print(
+                f"\nStored {stored_count} projects, scored {scored_count}; "
+                f"{skipped_cb} deferred to next run (circuit breaker)."
+            )
+        else:
+            print(f"\nStored {stored_count} projects")
 
         # Sample star counts for existing active projects
         # Newest-first: the events-rate budget serves recent discoveries before
@@ -1184,7 +1311,11 @@ class DiscoverStage:
             ).fetchall()
 
             sampled = 0
+            skipped_cb = 0
             for proj in active_projects:
+                if self._cb_tripped:
+                    skipped_cb += 1
+                    continue
                 try:
                     try:
                         proj_stars = int(proj['stars']) if proj['stars'] is not None else 0
@@ -1195,9 +1326,22 @@ class DiscoverStage:
                     sampled += 1
                 except Exception as e:
                     print(f"  Error sampling {proj['id']}: {e}")
+                    if self._cb_tripped:
+                        print(
+                            f"  Circuit breaker tripped mid-batch; stopping "
+                            f"sample loop with {sampled} done, "
+                            f"{skipped_cb} skipped."
+                        )
+                        break
             conn.commit()
 
-            print(f"  Sampled {sampled}/{len(active_projects)} existing projects")
+            if skipped_cb:
+                print(
+                    f"  Sampled {sampled}/{len(active_projects)} existing "
+                    f"projects; {skipped_cb} skipped due to circuit breaker."
+                )
+            else:
+                print(f"  Sampled {sampled}/{len(active_projects)} existing projects")
         finally:
             conn.close()
 
